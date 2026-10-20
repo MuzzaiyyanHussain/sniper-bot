@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Jupiter Compounding Bot — Setup Guide</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&family=Baloo+2:wght@600;700;800&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: oklch(98% 0.005 60);
+    --surface: oklch(100% 0.002 60);
+    --text: oklch(20% 0.02 60);
+    --text-muted: oklch(40% 0.015 60);
+    --orange: oklch(68% 0.2 40);
+    --orange-light: oklch(94% 0.04 40);
+    --green: oklch(62% 0.17 155);
+    --green-light: oklch(94% 0.04 155);
+    --teal: oklch(60% 0.12 210);
+    --teal-light: oklch(93% 0.03 210);
+    --yellow: oklch(78% 0.15 80);
+    --yellow-light: oklch(95% 0.04 80);
+    --red: oklch(55% 0.2 25);
+    --red-light: oklch(93% 0.04 25);
+    --border: oklch(88% 0.01 60);
+    --code-bg: oklch(18% 0.015 60);
+    --code-text: oklch(92% 0.01 60);
+    --radius: 14px;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    font-family: 'Nunito', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+
+  .deck { position: relative; height: 100vh; width: 100vw; display: flex; flex-direction: column; }
+
+  .progress-bar { position: fixed; top: 0; left: 0; height: 4px; background: var(--orange); z-index: 50; transition: width 0.3s ease; }
+
+  .slides-viewport { flex: 1; position: relative; overflow: hidden; }
+
+  .slide {
+    position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: flex-start;
+    opacity: 0; pointer-events: none; transform: translateX(24px);
+    transition: opacity 0.35s ease, transform 0.35s ease;
+    padding: 56px 64px 96px; overflow-y: auto;
+  }
+  .slide.active { opacity: 1; pointer-events: auto; transform: translateX(0); }
+
+  .slide-inner { max-width: 860px; margin: 0 auto; width: 100%; }
+
+  .eyebrow {
+    font-family: 'Baloo 2', cursive; font-size: 13px; font-weight: 700; color: var(--green);
+    text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px;
+  }
+
+  .nav-bar {
+    position: fixed; bottom: 0; left: 0; right: 0; height: 72px;
+    display: flex; align-items: center; justify-content: space-between; padding: 0 32px;
+    background: linear-gradient(0deg, var(--bg) 60%, transparent); z-index: 40;
+  }
+  .nav-btn {
+    font-family: 'Baloo 2', cursive; font-weight: 700; font-size: 15px;
+    border: 2px solid var(--border); background: var(--surface); color: var(--text);
+    padding: 10px 20px; border-radius: 10px; cursor: pointer;
+    display: flex; align-items: center; gap: 8px; transition: border-color 0.2s, color 0.2s, opacity 0.2s;
+  }
+  .nav-btn:hover { border-color: var(--orange); color: var(--orange); }
+  .nav-btn:disabled { opacity: 0.35; cursor: default; pointer-events: none; }
+
+  .slide-counter {
+    font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--text-muted);
+    background: var(--surface); border: 1px solid var(--border); padding: 8px 16px; border-radius: 20px; letter-spacing: 0.03em;
+  }
+  .slide-counter strong { color: var(--orange); }
+
+  .cover { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; text-align: center; }
+  .cover .icon { font-size: 56px; margin-bottom: 18px; }
+  .cover .brand { font-family: 'Baloo 2', cursive; font-size: 14px; font-weight: 700; color: var(--green); text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 18px; }
+  .cover h1 { font-family: 'Baloo 2', cursive; font-size: clamp(30px, 5vw, 48px); font-weight: 800; line-height: 1.15; margin-bottom: 16px; }
+  .cover h1 span { color: var(--orange); }
+  .cover .subtitle { font-size: 18px; color: var(--text-muted); font-weight: 600; margin-bottom: 28px; max-width: 60ch; }
+  .cover .hint { font-size: 13px; color: var(--text-muted); font-family: 'JetBrains Mono', monospace; }
+
+  .section-cover { height: 100%; display: flex; flex-direction: column; justify-content: center; }
+  .section-cover .section-num { font-family: 'Baloo 2', cursive; font-size: 88px; font-weight: 800; color: var(--orange-light); -webkit-text-stroke: 2px var(--orange); line-height: 1; margin-bottom: 8px; }
+  .section-cover .section-title { font-family: 'Baloo 2', cursive; font-size: clamp(28px, 4vw, 42px); font-weight: 800; margin-bottom: 18px; }
+  .section-cover .section-desc { font-size: 16px; color: var(--text-muted); max-width: 60ch; }
+
+  h2.slide-title { font-family: 'Baloo 2', cursive; font-size: 26px; font-weight: 800; margin-bottom: 22px; }
+  h3 { font-family: 'Baloo 2', cursive; font-size: 18px; font-weight: 700; margin-top: 22px; margin-bottom: 10px; }
+  h3:first-child { margin-top: 0; }
+  p { margin-bottom: 12px; font-size: 15px; color: var(--text-muted); max-width: 72ch; }
+
+  .order-badge {
+    display: inline-flex; align-items: center; gap: 8px; background: var(--orange-light); color: var(--orange);
+    font-family: 'Baloo 2', cursive; font-weight: 800; font-size: 13px; padding: 6px 14px; border-radius: 20px; margin-bottom: 16px;
+  }
+
+  .prereq { background: var(--yellow-light); border-radius: var(--radius); padding: 22px 26px; margin-top: 20px; }
+  .prereq h3 { margin-top: 0; }
+  .prereq ul { list-style: none; padding: 0; }
+  .prereq li { padding: 4px 0 4px 24px; position: relative; font-size: 14.5px; }
+  .prereq li::before { content: "•"; position: absolute; left: 8px; color: var(--yellow); font-weight: 800; }
+
+  .steps { list-style: none; counter-reset: step; padding: 0; margin: 12px 0; }
+  .steps li { counter-increment: step; position: relative; padding: 8px 0 8px 40px; font-size: 14.5px; line-height: 1.55; border-bottom: 1px solid var(--border); }
+  .steps li:last-child { border-bottom: none; }
+  .steps li::before {
+    content: counter(step); position: absolute; left: 0; top: 8px; width: 26px; height: 26px;
+    border-radius: 50%; background: var(--orange-light); color: var(--orange);
+    font-family: 'Baloo 2', cursive; font-weight: 800; font-size: 13px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .steps li strong { color: var(--text); }
+
+  .code-block {
+    background: var(--code-bg); border-radius: 10px; padding: 16px 20px; margin: 12px 0;
+    overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 12.5px;
+    line-height: 1.75; color: var(--code-text);
+  }
+  .code-block .comment { color: oklch(55% 0.01 60); }
+  .code-block .highlight { color: oklch(75% 0.15 80); }
+  .code-block .arrow { color: var(--orange); font-weight: 700; }
+
+  code { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; background: oklch(92% 0.01 60); padding: 2px 6px; border-radius: 5px; color: var(--orange); }
+
+  .callout { border-radius: var(--radius); padding: 16px 20px; margin: 14px 0; font-size: 13.5px; }
+  .callout.warning { background: var(--red-light); }
+  .callout.warning::before { content: "⚠️ Important"; display: block; font-weight: 800; margin-bottom: 5px; color: var(--red); }
+  .callout.success { background: var(--green-light); }
+  .callout.success::before { content: "✅ Success"; display: block; font-weight: 800; margin-bottom: 5px; color: var(--green); }
+  .callout.tip { background: var(--teal-light); }
+  .callout.tip::before { content: "💡 Tip"; display: block; font-weight: 800; margin-bottom: 5px; color: var(--teal); }
+
+  table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13px; }
+  th { text-align: left; padding: 8px 12px; background: var(--orange-light); font-weight: 700; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--orange); }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  td code { font-size: 11.5px; }
+
+  .flow { background: var(--code-bg); border-radius: 10px; padding: 18px 22px; margin: 14px 0; font-family: 'JetBrains Mono', monospace; font-size: 12.5px; line-height: 2; color: var(--code-text); }
+  .flow .step-label { color: oklch(75% 0.15 80); font-weight: 600; }
+  .flow .money { color: oklch(70% 0.15 155); }
+
+  .checklist { list-style: none; padding: 0; margin: 12px 0; }
+  .checklist li { padding: 6px 0 6px 30px; position: relative; font-size: 14.5px; }
+  .checklist li::before { content: "☐"; position: absolute; left: 4px; font-size: 16px; }
+
+  .footer-slide { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+  .footer-slide strong { color: var(--green); font-size: 19px; display: block; margin-bottom: 8px; }
+  .footer-slide .course-name { color: var(--text-muted); font-size: 14px; margin-bottom: 18px; max-width: 50ch; }
+  .footer-slide em { color: var(--text-muted); font-size: 13px; }
+
+  @media (max-width: 720px) {
+    .slide { padding: 32px 22px 96px; }
+    .section-cover .section-num { font-size: 60px; }
+    .nav-bar { padding: 0 16px; }
+    .nav-btn span.label { display: none; }
+  }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<div class="progress-bar" id="progressBar" style="width:0%"></div>
+
+<div class="deck">
+  <div class="slides-viewport" id="viewport">
+
+    <!-- 0: COVER -->
+    <section class="slide">
+      <div class="cover">
+        <div class="icon">🪐</div>
+        <div class="brand">Setup Guide</div>
+        <h1>Jupiter Compounding <span>Bot</span></h1>
+        <div class="subtitle">Automate your compounding strategy on Jupiter.ag (Solana) — deploy, configure, and run in about 5 minutes.</div>
+        <div class="hint">Use → / ← or the buttons below to navigate</div>
+      </div>
+    </section>
+
+    <!-- 1: Strategy overview -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="eyebrow">Overview</div>
+        <h2 class="slide-title">The Strategy</h2>
+        <div class="flow">Buy token with USDC <span class="arrow">→</span> wait for <span class="step-label">2x</span> <span class="arrow">→</span> sell
+<span class="arrow">→</span> save <span class="money">40%</span> <span class="arrow">→</span> reinvest <span class="money">60%</span> <span class="arrow">→</span> repeat</div>
+        <p>Every winning cycle locks in profit and compounds the rest forward into the next trade — automatically.</p>
+        <div class="prereq">
+          <h3>Follow the Steps in Order</h3>
+          <ul>
+            <li>Each setup step depends on the one before it — don't skip ahead</li>
+            <li>Total setup time: about <strong>5 minutes</strong></li>
+            <li>Always test in <strong>dry-run mode</strong> before going live</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2: Step 1 - Install dependencies -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="order-badge">STEP 1 OF 6</div>
+        <h2 class="slide-title">Install Python Dependencies</h2>
+        <h3>As the root user</h3>
+        <div class="code-block">sudo apt update
+sudo apt upgrade -y
+
+<span class="comment"># Install Python 3 and tools</span>
+sudo apt install python3 python3-pip python3-venv git unzip -y
+
+<span class="comment"># Verify it installed correctly</span>
+python3 --version</div>
+        <h3>As the application user</h3>
+        <p>This is the user account that will actually run the bot day-to-day.</p>
+        <div class="code-block">pip install -r requirements.txt</div>
+        <div class="callout tip">Run the first block as root just once. Everything after that should run as the regular user who will operate the bot.</div>
+      </div>
+    </section>
+
+    <!-- 3: Step 2 - copy files + configure env -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="order-badge">STEP 2 OF 6</div>
+        <h2 class="slide-title">Configure Your .env</h2>
+        <h3>Copy the scripts to your bot directory</h3>
+        <div class="code-block">cp bot.py /home/vboxuser/trading_app/
+cp token_scanner.py /home/vboxuser/trading_app/</div>
+        <h3>Create your config file</h3>
+        <div class="code-block">cp .env.example .env
+nano .env   <span class="comment"># or open in any editor</span></div>
+        <div class="callout warning">Fill in <code>WALLET_PRIVATE_KEY</code> — export it from Phantom: <strong>Settings → Security → Export Private Key</strong>. Never share this file with anyone.</div>
+      </div>
+    </section>
+
+    <!-- 4: env settings table -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="order-badge">STEP 2 OF 6</div>
+        <h2 class="slide-title">What Goes in .env</h2>
+        <div class="code-block">WALLET_PRIVATE_KEY=<span class="highlight">YOUR_PK_KEY</span>
+DRY_RUN=true
+TOKEN_MODE=scan
+STOP_LOSS_MULT=0.82
+POLL_INTERVAL_SEC=8
+MIN_PLAY_AMOUNT=1.00
+MAX_CONSEC_LOSSES=2
+LOSS_PAUSE_SEC=300
+STARTING_AMOUNT_USDC=2
+<span class="comment">#SOLANA_RPC_URL=https://api.mainnet-beta.solana.com</span>
+SOLANA_RPC_URL=<span class="highlight">https://solana-mainnet.g.alchemy.com/v2/YOUR_API_KEY</span>
+SLIPPAGE_BPS=150</div>
+        <table>
+          <tr><th>Setting</th><th>What It Does</th></tr>
+          <tr><td><code>WALLET_PRIVATE_KEY</code></td><td>Your Solana wallet's private key</td></tr>
+          <tr><td><code>DRY_RUN</code></td><td><code>true</code> = simulate only, <code>false</code> = real money</td></tr>
+          <tr><td><code>STOP_LOSS_MULT</code></td><td>0.82 = sell if price drops 18% from entry</td></tr>
+          <tr><td><code>STARTING_AMOUNT_USDC</code></td><td>How much USDC each cycle starts with</td></tr>
+        </table>
+        <div class="callout warning">Leave <code>DRY_RUN=true</code> until you've fully tested the bot.</div>
+      </div>
+    </section>
+
+    <!-- 5: Step 3 - RPC endpoint -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="order-badge">STEP 3 OF 6 · RECOMMENDED</div>
+        <h2 class="slide-title">Get a Free RPC Endpoint</h2>
+        <p>The public Solana RPC is rate-limited and unreliable for a bot that needs to check prices frequently.</p>
+        <ol class="steps">
+          <li>Go to <strong>https://www.helius.dev</strong> and sign up (the free tier is plenty)</li>
+          <li>Copy the RPC URL Helius gives you</li>
+          <li>Paste it into <code>SOLANA_RPC_URL</code> in your <code>.env</code> file</li>
+        </ol>
+        <div class="callout tip">A dedicated RPC endpoint means fewer dropped connections and faster price checks — worth the two minutes it takes to sign up.</div>
+      </div>
+    </section>
+
+    <!-- 6: Step 4 - Birdeye -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="order-badge">STEP 4 OF 6 · OPTIONAL</div>
+        <h2 class="slide-title">Get a Birdeye API Key</h2>
+        <p>Birdeye gives more reliable price feeds than Jupiter's fallback pricing.</p>
+        <ol class="steps">
+          <li>Go to <strong>https://birdeye.so</strong></li>
+          <li>Navigate to <strong>Developer → API Keys</strong></li>
+          <li>Generate a free key</li>
+          <li>Paste it into <code>BIRDEYE_API_KEY</code> in your <code>.env</code> file</li>
+        </ol>
+        <div class="callout tip">This step is optional but recommended if you want more accurate 2x-target detection.</div>
+      </div>
+    </section>
+
+    <!-- 7: Step 5 - dry run -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="order-badge">STEP 5 OF 6</div>
+        <h2 class="slide-title">Run in Dry-Run Mode First</h2>
+        <div class="code-block">python bot.py</div>
+        <p>With <code>DRY_RUN=true</code>, you'll see the full projection table and simulated cycles — no real transactions are made.</p>
+        <div class="callout success">Use this stage to confirm your settings, RPC connection, and compounding math all look right before any real funds are involved.</div>
+      </div>
+    </section>
+
+    <!-- 8: Step 6 - go live -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="order-badge">STEP 6 OF 6</div>
+        <h2 class="slide-title">Go Live</h2>
+        <p>Once you're happy with the dry run results, switch the bot to real trading:</p>
+        <div class="code-block"><span class="comment"># In .env, change:</span>
+DRY_RUN=false</div>
+        <p>Then run the bot again:</p>
+        <div class="code-block">python bot.py</div>
+        <div class="callout warning">Keep the terminal open. If it closes, just restart — the bot picks up exactly where it left off using <code>journal.json</code>.</div>
+      </div>
+    </section>
+
+    <!-- 9: How it works -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="eyebrow">Reference</div>
+        <h2 class="slide-title">How It Works</h2>
+        <div class="flow">Cycle 1:  Buy $7.77 USDC of SOL
+          <span class="arrow">→</span> Monitor price every 10 seconds
+          <span class="arrow">→</span> Price hits 2x entry price
+          <span class="arrow">→</span> Sell all SOL back to USDC
+          <span class="arrow">→</span> Receive ~$15.54 USDC
+          <span class="arrow">→</span> Save <span class="money">$6.22</span> (40%)
+          <span class="arrow">→</span> Reinvest <span class="money">$9.32</span> (60%) → next cycle
+
+Cycle 2:  Buy $9.32 USDC of SOL
+          <span class="arrow">→</span> ... repeat</div>
+        <p>This matches the spreadsheet exactly: each win compounds 60% forward, and 40% is locked in as saved profit.</p>
+      </div>
+    </section>
+
+    <!-- 10: Files table -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="eyebrow">Reference</div>
+        <h2 class="slide-title">Files</h2>
+        <table>
+          <tr><th>File</th><th>Purpose</th></tr>
+          <tr><td><code>bot.py</code></td><td>Main bot</td></tr>
+          <tr><td><code>.env</code></td><td>Your config — never share this</td></tr>
+          <tr><td><code>.env.example</code></td><td>Template</td></tr>
+          <tr><td><code>journal.json</code></td><td>Auto-created — tracks all cycles and state</td></tr>
+          <tr><td><code>bot.log</code></td><td>Full trade log</td></tr>
+        </table>
+      </div>
+    </section>
+
+    <!-- 11: Realistic expectations -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="eyebrow">Reference</div>
+        <h2 class="slide-title">Realistic Expectations</h2>
+        <p>The bot executes the compounding math correctly, but the 2x target is <strong>not guaranteed</strong>:</p>
+        <ul class="checklist">
+          <li>SOL price moves — hitting 2x may take hours, days, or never happen</li>
+          <li>If price drops significantly, you'll sell at a loss (or hold until it recovers)</li>
+          <li>Enable <code>STOP_LOSS_MULT=0.8</code> to auto-sell if price drops 20%</li>
+          <li>Gas and slippage cost ~0.5% per swap — this adds up over 30 cycles</li>
+        </ul>
+        <div class="callout warning">Start small. Test with $7.77 as shown in the spreadsheet before scaling up.</div>
+      </div>
+    </section>
+
+    <!-- 12: Customising the token -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="eyebrow">Reference</div>
+        <h2 class="slide-title">Customising the Token</h2>
+        <p>Change <code>OUTPUT_MINT</code> in <code>.env</code> to trade any Solana token:</p>
+        <div class="code-block"><span class="comment"># Volatile memecoins (higher chance of 2x, higher chance of 0)</span>
+BONK = DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263
+WIF  = EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm
+JUP  = JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN</div>
+        <div class="callout tip">More volatile tokens can hit 2x faster — but they're also far more likely to go to zero. Choose deliberately.</div>
+      </div>
+    </section>
+
+    <!-- 13: Emergency stop -->
+    <section class="slide">
+      <div class="slide-inner">
+        <div class="eyebrow">Reference</div>
+        <h2 class="slide-title">Emergency Stop</h2>
+        <ol class="steps">
+          <li>Press <strong>Ctrl+C</strong> at any time — your state is saved in <code>journal.json</code></li>
+          <li>The bot resumes right where it left off on next start</li>
+          <li>To exit an open position manually: go to <strong>jup.ag</strong>, connect your wallet, and swap back to USDC</li>
+          <li>Then delete <code>journal.json</code> and restart</li>
+        </ol>
+        <div class="callout warning">Deleting <code>journal.json</code> resets the bot's memory of your cycle — only do this after manually closing any open position.</div>
+      </div>
+    </section>
+
+    <!-- 14: Closing -->
+    <section class="slide">
+      <div class="footer-slide">
+        <strong>🪐 Jupiter Compounding Bot</strong>
+        <div class="course-name">You're ready to deploy. Follow the six setup steps in order, test in dry-run mode, then go live.</div>
+        <em>To save as PDF: Open in browser → Ctrl+P → Save as PDF</em>
+      </div>
+    </section>
+
+  </div>
+
+  <div class="nav-bar">
+    <button class="nav-btn" id="prevBtn" onclick="goTo(current-1)">‹ <span class="label">Prev</span></button>
+    <div class="slide-counter"><strong id="curNum">1</strong> / <span id="totalNum">1</span></div>
+    <button class="nav-btn" id="nextBtn" onclick="goTo(current+1)"><span class="label">Next</span> ›</button>
+  </div>
+</div>
+
+<script>
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  const total = slides.length;
+  let current = 0;
+  document.getElementById('totalNum').textContent = total;
+
+  function render() {
+    slides.forEach((s, i) => s.classList.toggle('active', i === current));
+    document.getElementById('curNum').textContent = current + 1;
+    document.getElementById('progressBar').style.width = ((current + 1) / total * 100) + '%';
+    document.getElementById('prevBtn').disabled = current === 0;
+    document.getElementById('nextBtn').disabled = current === total - 1;
+  }
+
+  function goTo(i) {
+    if (i < 0 || i >= total) return;
+    current = i;
+    render();
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === ' ') goTo(current + 1);
+    if (e.key === 'ArrowLeft') goTo(current - 1);
+  });
+
+  let touchStartX = null;
+  document.getElementById('viewport').addEventListener('touchstart', e => touchStartX = e.touches[0].clientX);
+  document.getElementById('viewport').addEventListener('touchend', e => {
+    if (touchStartX === null) return;
+    const dx = e.changedTouches[0].clientX - touchStartX;
+    if (dx > 50) goTo(current - 1);
+    if (dx < -50) goTo(current + 1);
+    touchStartX = null;
+  });
+
+  render();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,1079 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- skill:chrome -->
+<style>
+/* Credit line — bottom-right */
+.design-ui-credit {
+  position: fixed;
+  bottom: 12px;
+  right: 12px;
+  font: 11px/1 system-ui, sans-serif;
+  color: rgba(128,128,128,0.5);
+  pointer-events: none;
+  z-index: 2147483647;
+  transition: opacity 0.4s ease;
+  user-select: none;
+  letter-spacing: 0.02em;
+}
+
+/* Hide chrome on touch devices */
+@media (hover: none) {
+  .design-ui-credit { display: none; }
+}
+
+/* Print fixes */
+@media print {
+  * {
+    transition: none !important;
+    animation: none !important;
+    box-shadow: none !important;
+  }
+  body {
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+  .design-ui-credit { display: none !important; }
+}
+
+</style>
+<script>
+(function () {
+    // Design-ui pages are single compositions, so the whole body is editable.
+    function markEditable() {
+        document.body.classList.add('artifact-editable');
+    }
+
+    // Credit badge with idle-fade. Hover devices only.
+    function initChromeUI() {
+        if (!matchMedia('(hover: hover)').matches) return;
+
+        var credit = document.createElement('div');
+        credit.className = 'design-ui-credit';
+        credit.setAttribute('aria-hidden', 'true');
+        credit.innerHTML = '\u{1F49C} by ClickUp Brain';
+        document.body.appendChild(credit);
+
+        var timer = null;
+        var fade = function (out) { credit.style.opacity = out ? '0' : ''; };
+        fade(true);
+        var show = function () {
+            fade(false);
+            clearTimeout(timer);
+            timer = setTimeout(function () { fade(true); }, 3000);
+        };
+        document.addEventListener('mousemove', show);
+        show();
+    }
+
+    function init() {
+        markEditable();
+        initChromeUI();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+})();
+
+</script>
+<!-- /skill:chrome -->
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Setup Guide — Solana Memecoin Sniper Bot</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&family=Baloo+2:wght@600;700;800&family=JetBrains+Mono:wght@400;500&display=swap">
+  <style>
+    :root {
+      --bg: oklch(98% 0.005 60);
+      --surface: oklch(100% 0.002 60);
+      --text: oklch(20% 0.02 60);
+      --text-muted: oklch(40% 0.015 60);
+      --orange: oklch(68% 0.2 40);
+      --orange-light: oklch(94% 0.04 40);
+      --green: oklch(62% 0.17 155);
+      --green-light: oklch(94% 0.04 155);
+      --teal: oklch(60% 0.12 210);
+      --teal-light: oklch(93% 0.03 210);
+      --yellow: oklch(78% 0.15 80);
+      --yellow-light: oklch(95% 0.04 80);
+      --red: oklch(55% 0.2 25);
+      --red-light: oklch(93% 0.04 25);
+      --border: oklch(88% 0.01 60);
+      --code-bg: oklch(18% 0.015 60);
+      --code-text: oklch(92% 0.01 60);
+      --radius: 14px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Nunito', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.7;
+      font-size: 16px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .page {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 48px 32px;
+    }
+
+    .header {
+      text-align: center;
+      margin-bottom: 56px;
+      padding-bottom: 40px;
+      border-bottom: 2px solid var(--border);
+    }
+    .header .logo {
+      width: 180px;
+      height: auto;
+      margin-bottom: 20px;
+    }
+    .header .brand {
+      font-family: 'Baloo 2', cursive;
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--green);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 12px;
+    }
+    .header h1 {
+      font-family: 'Baloo 2', cursive;
+      font-size: clamp(28px, 5vw, 40px);
+      font-weight: 800;
+      color: var(--text);
+      line-height: 1.2;
+      margin-bottom: 12px;
+    }
+    .header h1 span { color: var(--orange); }
+    .header .subtitle {
+      font-size: 18px;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .toc {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px 32px;
+      margin-bottom: 48px;
+    }
+    .toc h2 {
+      font-family: 'Baloo 2', cursive;
+      font-size: 20px;
+      margin-bottom: 16px;
+      color: var(--text);
+    }
+    .toc ol {
+      list-style: none;
+      counter-reset: toc;
+    }
+    .toc li {
+      counter-increment: toc;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+      font-size: 15px;
+    }
+    .toc li:last-child { border-bottom: none; }
+    .toc li::before {
+      content: counter(toc, decimal-leading-zero);
+      font-family: 'Baloo 2', cursive;
+      font-weight: 800;
+      color: var(--orange);
+      margin-right: 12px;
+      font-size: 18px;
+    }
+
+    .prereq {
+      background: var(--yellow-light);
+      border-radius: var(--radius);
+      padding: 24px 28px;
+      margin-bottom: 48px;
+    }
+    .prereq h3 {
+      font-family: 'Baloo 2', cursive;
+      font-size: 18px;
+      margin-bottom: 12px;
+      color: var(--text);
+    }
+    .prereq ul { list-style: none; padding: 0; }
+    .prereq li {
+      padding: 4px 0 4px 24px;
+      position: relative;
+      font-size: 15px;
+    }
+    .prereq li::before {
+      content: "•";
+      position: absolute;
+      left: 8px;
+      color: var(--yellow);
+      font-weight: 800;
+    }
+
+    .section {
+      margin-bottom: 56px;
+      page-break-inside: avoid;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 28px;
+      padding-bottom: 16px;
+      border-bottom: 2px solid var(--border);
+    }
+    .section-num {
+      font-family: 'Baloo 2', cursive;
+      font-size: 36px;
+      font-weight: 800;
+      color: var(--orange);
+      line-height: 1;
+    }
+    .section-title {
+      font-family: 'Baloo 2', cursive;
+      font-size: 26px;
+      font-weight: 800;
+      color: var(--text);
+      line-height: 1.2;
+    }
+
+    h3 {
+      font-family: 'Baloo 2', cursive;
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text);
+      margin-top: 32px;
+      margin-bottom: 12px;
+    }
+
+    p {
+      margin-bottom: 14px;
+      font-size: 15px;
+      color: var(--text-muted);
+      max-width: 72ch;
+    }
+
+    .video-box {
+      margin: 24px 0;
+      border-radius: var(--radius);
+      overflow: hidden;
+      border: 2px solid var(--border);
+      background: var(--surface);
+    }
+    .video-box iframe {
+      width: 100%;
+      aspect-ratio: 16/9;
+      display: block;
+      border: none;
+    }
+    .video-box .video-caption {
+      padding: 12px 16px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .video-box .video-caption::before {
+      content: "▶";
+      color: var(--orange);
+      font-size: 14px;
+    }
+
+    .video-link {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 16px 20px;
+      background: var(--surface);
+      border: 2px solid var(--border);
+      border-radius: var(--radius);
+      margin: 20px 0;
+      text-decoration: none;
+      transition: border-color 0.2s;
+    }
+    .video-link:hover { border-color: var(--orange); }
+    .video-link .play-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: var(--orange);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .video-link .play-icon::after {
+      content: "";
+      width: 0;
+      height: 0;
+      border-left: 12px solid white;
+      border-top: 7px solid transparent;
+      border-bottom: 7px solid transparent;
+      margin-left: 3px;
+    }
+    .video-link .video-info { flex: 1; }
+    .video-link .video-title {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text);
+      margin-bottom: 2px;
+    }
+    .video-link .video-meta {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .steps {
+      list-style: none;
+      counter-reset: step;
+      padding: 0;
+      margin: 16px 0;
+    }
+    .steps li {
+      counter-increment: step;
+      position: relative;
+      padding: 10px 0 10px 44px;
+      font-size: 15px;
+      line-height: 1.6;
+      border-bottom: 1px solid var(--border);
+    }
+    .steps li:last-child { border-bottom: none; }
+    .steps li::before {
+      content: counter(step);
+      position: absolute;
+      left: 0;
+      top: 10px;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: var(--orange-light);
+      color: var(--orange);
+      font-family: 'Baloo 2', cursive;
+      font-weight: 800;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .steps li strong { color: var(--text); }
+
+    .code-block {
+      background: var(--code-bg);
+      border-radius: 10px;
+      padding: 20px 24px;
+      margin: 16px 0;
+      overflow-x: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13.5px;
+      line-height: 1.8;
+      color: var(--code-text);
+    }
+    .code-block .comment { color: oklch(55% 0.01 60); }
+    .code-block .highlight { color: oklch(75% 0.15 80); }
+
+    code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      background: oklch(92% 0.01 60);
+      padding: 2px 7px;
+      border-radius: 5px;
+      color: var(--orange);
+    }
+
+    .callout {
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      margin: 20px 0;
+      font-size: 14px;
+    }
+    .callout.warning { background: var(--red-light); }
+    .callout.warning::before {
+      content: "⚠️ Warning";
+      display: block;
+      font-weight: 800;
+      margin-bottom: 6px;
+      color: var(--red);
+    }
+    .callout.success { background: var(--green-light); }
+    .callout.success::before {
+      content: "✅ Success";
+      display: block;
+      font-weight: 800;
+      margin-bottom: 6px;
+      color: var(--green);
+    }
+    .callout.tip { background: var(--teal-light); }
+    .callout.tip::before {
+      content: "💡 Tip";
+      display: block;
+      font-weight: 800;
+      margin-bottom: 6px;
+      color: var(--teal);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 20px 0;
+      font-size: 14px;
+    }
+    th {
+      text-align: left;
+      padding: 10px 14px;
+      background: var(--orange-light);
+      font-weight: 700;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--orange);
+    }
+    td {
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    td code { font-size: 12px; }
+
+    .checklist { list-style: none; padding: 0; margin: 16px 0; }
+    .checklist li {
+      padding: 8px 0 8px 32px;
+      position: relative;
+      font-size: 15px;
+    }
+    .checklist li::before {
+      content: "☐";
+      position: absolute;
+      left: 4px;
+      font-size: 18px;
+    }
+
+    .screenshot {
+      background: var(--surface);
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 32px;
+      margin: 20px 0;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .screenshot .label {
+      display: block;
+      margin-top: 8px;
+      font-size: 12px;
+      font-weight: 400;
+    }
+
+    .method-tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 0;
+    }
+    .method-tab {
+      padding: 10px 20px;
+      border-radius: 10px 10px 0 0;
+      font-family: 'Baloo 2', cursive;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      border: 2px solid var(--border);
+      border-bottom: none;
+      background: var(--bg);
+      color: var(--text-muted);
+      transition: all 0.2s;
+    }
+    .method-tab.active {
+      background: var(--surface);
+      color: var(--orange);
+      border-color: var(--orange);
+    }
+    .method-tab:hover:not(.active) { color: var(--text); }
+    .method-content {
+      border: 2px solid var(--border);
+      border-radius: 0 var(--radius) var(--radius) var(--radius);
+      padding: 28px;
+      background: var(--surface);
+      margin-bottom: 24px;
+    }
+    .method-panel { display: none; }
+    .method-panel.active { display: block; }
+    .method-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 12px;
+    }
+    .method-badge.recommended { background: var(--green-light); color: var(--green); }
+    .method-badge.easy { background: var(--teal-light); color: var(--teal); }
+    .method-badge.advanced { background: var(--yellow-light); color: var(--yellow); }
+
+    .file-tree {
+      background: var(--code-bg);
+      border-radius: 10px;
+      padding: 20px 24px;
+      margin: 16px 0;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      line-height: 2;
+      color: var(--code-text);
+    }
+    .file-tree .folder { color: oklch(70% 0.15 210); }
+    .file-tree .file { color: oklch(85% 0.05 60); }
+    .file-tree .generated { color: oklch(55% 0.01 60); font-style: italic; }
+
+    .footer {
+      margin-top: 64px;
+      padding-top: 32px;
+      border-top: 2px solid var(--border);
+      text-align: center;
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .footer .logo-footer {
+      width: 100px;
+      height: auto;
+      margin-bottom: 12px;
+    }
+    .footer strong { color: var(--green); }
+
+    @media print {
+      body { background: white; font-size: 12pt; }
+      .page { padding: 0; max-width: 100%; }
+      .code-block { font-size: 10pt; }
+      .section { page-break-inside: avoid; }
+      .video-box iframe { display: none; }
+      .method-panel { display: block !important; }
+      .method-tabs { display: none; }
+    }
+    @media (max-width: 640px) {
+      .page { padding: 24px 16px; }
+      .section-num { font-size: 28px; }
+      .section-title { font-size: 22px; }
+      .method-tabs { flex-wrap: wrap; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+
+    <div class="header">
+      <img src="https://t90152612936.p.clickup-attachments.com/t90152612936/c71ed0a2-274c-45ac-8b5e-f7abd7870796/generated-image-8bb8c92f-6c64-482a-aeb3-95c0c3650813.png?view=open" alt="IT Forest Learning Group" class="logo">
+      <div class="brand">IT Forest Learning Group</div>
+      <h1>Setup Guide: Solana Memecoin <span>Sniper Bot</span></h1>
+      <div class="subtitle">From Zero to Running — Complete Beginner Guide</div>
+    </div>
+
+    <div class="toc">
+      <h2>What We'll Do</h2>
+      <ol>
+        <li>Install VirtualBox (run Ubuntu inside your computer)</li>
+        <li>Install Ubuntu 22.04 (the Linux operating system)</li>
+        <li>Deploy the bot scripts and configuration</li>
+        <li>Test everything in safe DRY_RUN mode</li>
+      </ol>
+    </div>
+
+    <div class="prereq">
+      <h3>Before You Start, Make Sure You Have:</h3>
+      <ul>
+        <li>A computer with at least <strong>8GB RAM</strong> (16GB recommended)</li>
+        <li>At least <strong>50GB free disk space</strong></li>
+        <li>A working internet connection</li>
+        <li>About <strong>1 hour</strong> of free time</li>
+        <li>No prior Linux experience needed!</li>
+      </ul>
+    </div>
+
+    <!-- STEP 1 -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-num">01</div>
+        <div class="section-title">Install VirtualBox</div>
+      </div>
+
+      <p>VirtualBox lets you run Ubuntu inside your current operating system (Windows or Mac) without replacing anything. Think of it as a "computer inside your computer."</p>
+
+      <div class="video-box">
+        <iframe src="https://www.youtube.com/embed/Iddly8Ml3gE" title="How to Install Ubuntu in VirtualBox (2026)" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+        <div class="video-caption">Watch: How to Install Ubuntu in VirtualBox (2026 Updated) — TechOpt</div>
+      </div>
+
+      <h3>1.1 Download VirtualBox</h3>
+      <ol class="steps">
+        <li>Open your web browser</li>
+        <li>Go to: <strong>https://www.virtualbox.org/wiki/Downloads</strong></li>
+        <li>Click the download for your system:<br><strong>Windows:</strong> Click "Windows hosts"<br><strong>Mac:</strong> Click "macOS / Intel hosts" (or Apple Silicon for newer Macs)</li>
+        <li>Wait for the download to finish</li>
+      </ol>
+
+      <div class="screenshot">📸 You should see this page — click the link for your operating system<span class="label">virtualbox.org/wiki/Downloads</span></div>
+
+      <h3>1.2 Install on Windows</h3>
+      <ol class="steps">
+        <li>Double-click the downloaded file (e.g., <code>VirtualBox-7.x.x-Win.exe</code>)</li>
+        <li>Click <strong>Next</strong> on the welcome screen</li>
+        <li>Click <strong>Next</strong> again (keep default settings)</li>
+        <li>Click <strong>Next</strong> (network warning is normal, click Yes)</li>
+        <li>Click <strong>Install</strong></li>
+        <li>If asked "allow this app to make changes?" click <strong>Yes</strong></li>
+        <li>Click <strong>Finish</strong> when done</li>
+      </ol>
+
+      <h3>1.3 Install on Mac</h3>
+      <ol class="steps">
+        <li>Double-click the downloaded <code>.dmg</code> file</li>
+        <li>Double-click the <strong>VirtualBox.pkg</strong> icon</li>
+        <li>Follow prompts: click <strong>Continue</strong> and <strong>Install</strong></li>
+        <li>If asked, go to System Preferences → Security &amp; Privacy → click <strong>Allow</strong></li>
+        <li>Restart your Mac if prompted</li>
+      </ol>
+
+      <h3>1.4 Verify It Worked</h3>
+      <p>Search for "VirtualBox" in your Start Menu (Windows) or Applications (Mac) and open it.</p>
+      <div class="screenshot">📸 The VirtualBox Manager — an empty list with toolbar buttons at the top<span class="label">This is what success looks like!</span></div>
+      <div class="callout success">If you see the VirtualBox Manager window, you're done with Step 1!</div>
+    </div>
+
+    <!-- STEP 2 -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-num">02</div>
+        <div class="section-title">Install Ubuntu 22.04</div>
+      </div>
+
+      <div class="video-box">
+        <iframe src="https://www.youtube.com/embed/mi1uCCdvCL0" title="How to Install Ubuntu Linux on VirtualBox in 2026" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+        <div class="video-caption">Watch: How to Install Ubuntu Linux on VirtualBox in 2026 — Inno Techy</div>
+      </div>
+
+      <h3>2.1 Download Ubuntu</h3>
+      <ol class="steps">
+        <li>Go to: <strong>https://releases.ubuntu.com/22.04/</strong></li>
+        <li>Click <strong>"64-bit PC (AMD64) desktop image"</strong></li>
+        <li>Wait for download to complete (about 4.5GB, may take 10-30 minutes)</li>
+      </ol>
+
+      <h3>2.2 Create a Virtual Machine</h3>
+      <ol class="steps">
+        <li>Open <strong>VirtualBox</strong></li>
+        <li>Click the <strong>New</strong> button (blue star icon)</li>
+        <li>Set <strong>Name:</strong> <code>Ubuntu Bot</code></li>
+        <li>Set <strong>ISO Image:</strong> Click dropdown → Other → browse to your downloaded <code>.iso</code> file</li>
+        <li>Set <strong>Type:</strong> Linux, <strong>Version:</strong> Ubuntu (64-bit)</li>
+        <li>Check <strong>"Skip Unattended Installation"</strong></li>
+        <li>Click <strong>Next</strong></li>
+      </ol>
+
+      <div class="screenshot">📸 New Virtual Machine dialog — fill in the name, select your ISO file<span class="label">Make sure "Skip Unattended Installation" is checked</span></div>
+
+      <h3>2.3 Allocate Resources</h3>
+      <ol class="steps">
+        <li><strong>Memory:</strong> Set to <strong>4096 MB</strong> (4GB). If you have 16GB+ RAM, use 8192 MB</li>
+        <li><strong>Processors:</strong> Set to <strong>2 CPUs</strong></li>
+        <li>Click <strong>Next</strong></li>
+      </ol>
+
+      <div class="callout tip">More RAM = smoother experience. If your computer has 16GB, give the VM 8GB.</div>
+
+      <h3>2.4 Create Virtual Hard Disk</h3>
+      <ol class="steps">
+        <li>Select <strong>"Create a Virtual Hard Disk Now"</strong></li>
+        <li>Set size to <strong>40 GB</strong></li>
+        <li>Click <strong>Next</strong>, then <strong>Finish</strong></li>
+      </ol>
+
+      <h3>2.5 Install Ubuntu</h3>
+      <ol class="steps">
+        <li>Select <strong>Ubuntu Bot</strong> in the list, click the green <strong>Start</strong> arrow</li>
+        <li>Wait for Ubuntu to load (1-2 minutes)</li>
+        <li>Select English, click <strong>"Install Ubuntu"</strong></li>
+        <li>Choose keyboard layout, click <strong>Continue</strong></li>
+        <li>Select <strong>"Normal installation"</strong>, check "Download updates", click <strong>Continue</strong></li>
+        <li>Select <strong>"Erase disk and install Ubuntu"</strong>, click <strong>Install Now</strong></li>
+      </ol>
+
+      <div class="callout tip">Don't worry about "Erase disk"! This only erases the virtual disk inside VirtualBox, NOT your real computer. Your files are completely safe.</div>
+
+      <ol class="steps" style="counter-reset: step 6;">
+        <li>Select your timezone, click <strong>Continue</strong></li>
+        <li>Create your account: pick a name, username, and password you'll remember</li>
+        <li>Select <strong>"Log in automatically"</strong> for convenience</li>
+        <li>Click <strong>Continue</strong> and wait 10-20 minutes for installation</li>
+        <li>Click <strong>"Restart Now"</strong>, press Enter when prompted</li>
+      </ol>
+
+      <div class="callout success">Ubuntu is installed! You should see the desktop after restart.</div>
+
+      <h3>2.6 Install Guest Additions (Recommended)</h3>
+      <ol class="steps">
+        <li>In VirtualBox menu: <strong>Devices → Insert Guest Additions CD image</strong></li>
+        <li>Click <strong>Run</strong> if Ubuntu asks, enter your password</li>
+        <li>Wait for it to finish, then restart Ubuntu</li>
+      </ol>
+    </div>
+
+    <!-- STEP 3 -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-num">03</div>
+        <div class="section-title">Deploy the Scripts</div>
+      </div>
+
+      <h3>3.1 Open the Terminal</h3>
+      <p>Press <strong>Ctrl + Alt + T</strong> to open the Terminal.</p>
+      <div class="callout tip">To paste into the terminal, use <strong>Ctrl + Shift + V</strong> (not just Ctrl+V).</div>
+
+      <h3>3.2 Update Ubuntu</h3>
+      <div class="code-block">sudo apt update
+sudo apt upgrade -y</div>
+      <p>Enter your password when asked. You won't see it typing — that's a security feature.</p>
+
+      <h3>3.3 Install Python 3 and Tools</h3>
+      <div class="code-block">sudo apt install python3 python3-pip python3-venv git unzip -y</div>
+      <p>Verify:</p>
+      <div class="code-block">python3 --version</div>
+      <div class="callout success">You should see <code>Python 3.10.x</code> or higher.</div>
+
+      <div class="video-box">
+        <iframe src="https://www.youtube.com/embed/yjO4daXsAxg" title="How to Install Python 3 on Ubuntu Linux" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
+        <div class="video-caption">Watch: How to Install Python 3 on Ubuntu — DevSecOps Club</div>
+      </div>
+
+      <h3>3.4 Get the Bot Code</h3>
+      <p>Choose ONE of these three methods. Method A is recommended for beginners:</p>
+
+      <div class="method-tabs">
+        <div class="method-tab active" onclick="switchMethod('a')">A: Git Clone</div>
+        <div class="method-tab" onclick="switchMethod('b')">B: Zip Download</div>
+        <div class="method-tab" onclick="switchMethod('c')">C: Manual</div>
+      </div>
+
+      <div class="method-content">
+        <div class="method-panel active" id="method-a">
+          <div class="method-badge recommended">Recommended</div>
+          <p><strong>Best for:</strong> Anyone comfortable typing one command. Easiest to update later.</p>
+          <div class="code-block"><span class="comment"># Clone the repository</span>
+git clone https://github.com/YOUR_REPO/sniper-bot.git ~/sniper-bot
+cd ~/sniper-bot</div>
+          <p>That's it. All files are now on your machine.</p>
+          <div class="callout tip">Replace the URL above with the actual repository link provided in your course materials.</div>
+        </div>
+
+        <div class="method-panel" id="method-b">
+          <div class="method-badge easy">Easy</div>
+          <p><strong>Best for:</strong> If you downloaded the zip file from Udemy's course resources.</p>
+          <ol class="steps">
+            <li>Download the <code>sniper-bot.zip</code> from the Udemy course resources section</li>
+            <li>If downloaded on your host computer, drag and drop the zip into your Ubuntu VM</li>
+            <li>In terminal, run:</li>
+          </ol>
+          <div class="code-block"><span class="comment"># Navigate to where the zip was downloaded</span>
+cd ~/Downloads
+
+<span class="comment"># Unzip it</span>
+unzip sniper-bot.zip -d ~/sniper-bot
+
+<span class="comment"># Go into the folder</span>
+cd ~/sniper-bot</div>
+          <div class="callout tip">If drag-and-drop doesn't work, install Guest Additions first (Step 2.6) or use a USB drive.</div>
+        </div>
+
+        <div class="method-panel" id="method-c">
+          <div class="method-badge advanced">Learn Every Line</div>
+          <p><strong>Best for:</strong> If you want to understand the code by typing it yourself.</p>
+          <div class="code-block"><span class="comment"># Create the folder</span>
+mkdir ~/sniper-bot
+cd ~/sniper-bot</div>
+          <p>Create each file with <code>nano</code>:</p>
+          <div class="code-block"><span class="comment"># Create token_scanner.py</span>
+nano token_scanner.py
+<span class="comment"># Paste the full token_scanner.py code, then: Ctrl+O, Enter, Ctrl+X</span>
+
+<span class="comment"># Create bot.py</span>
+nano bot.py
+<span class="comment"># Paste the full bot.py code, then: Ctrl+O, Enter, Ctrl+X</span></div>
+          <p>The code files are shown line-by-line in the course video modules.</p>
+        </div>
+      </div>
+
+      <h3>3.5 Set Up Virtual Environment &amp; Dependencies</h3>
+      <div class="code-block"><span class="comment"># Create virtual environment</span>
+python3 -m venv venv
+
+<span class="comment"># Activate it (you'll see "(venv)" appear in your prompt)</span>
+source venv/bin/activate
+
+<span class="comment"># Install all dependencies from requirements.txt</span>
+pip install -r requirements.txt</div>
+
+      <div class="callout tip">The <code>requirements.txt</code> file is included with the code. It installs everything the bot needs in one command.</div>
+
+      <h3>3.6 Configure Your .env File</h3>
+      <p>Create your configuration file:</p>
+      <div class="code-block">nano .env</div>
+      <p>Paste this exact content (replace YOUR_KEY values with your own):</p>
+      <div class="code-block">WALLET_PRIVATE_KEY=<span class="highlight">YOUR_KEY</span>
+DRY_RUN=true
+TOKEN_MODE=scan
+STOP_LOSS_MULT=0.82
+POLL_INTERVAL_SEC=8
+MIN_PLAY_AMOUNT=1.00
+MAX_CONSEC_LOSSES=2
+LOSS_PAUSE_SEC=300
+STARTING_AMOUNT_USDC=2
+<span class="comment">#SOLANA_RPC_URL=https://api.mainnet-beta.solana.com</span>
+SOLANA_RPC_URL=<span class="highlight">https://solana-mainnet.g.alchemy.com/v2/YOUR_KEY</span>
+SLIPPAGE_BPS=150</div>
+      <p>Save: <strong>Ctrl+O</strong>, <strong>Enter</strong>, <strong>Ctrl+X</strong>.</p>
+
+      <div class="callout tip">Notice the commented-out line (<code>#SOLANA_RPC_URL</code>). The default Solana RPC is slow and rate-limited. We use Alchemy instead. Get a free API key at <strong>alchemy.com</strong> and replace <code>YOUR_KEY</code> with your actual key.</div>
+
+      <div class="callout warning"><strong>Important:</strong> Keep <code>DRY_RUN=true</code> for testing! Only change to <code>false</code> after completing the full 24-hour test and the Going Live module.</div>
+
+      <p><strong>What each setting means:</strong></p>
+      <table>
+        <tr><th>Setting</th><th>What It Does</th></tr>
+        <tr><td><code>WALLET_PRIVATE_KEY</code></td><td>Your Solana wallet's private key (base58 format)</td></tr>
+        <tr><td><code>DRY_RUN</code></td><td><code>true</code> = simulate trades, <code>false</code> = real money</td></tr>
+        <tr><td><code>TOKEN_MODE</code></td><td><code>scan</code> = auto-find tokens via WebSocket</td></tr>
+        <tr><td><code>STOP_LOSS_MULT</code></td><td>0.82 = sell if price drops 18% from entry</td></tr>
+        <tr><td><code>POLL_INTERVAL_SEC</code></td><td>Check price every 8 seconds</td></tr>
+        <tr><td><code>MIN_PLAY_AMOUNT</code></td><td>$1 floor (resets bankroll if it drops below this)</td></tr>
+        <tr><td><code>MAX_CONSEC_LOSSES</code></td><td>Pause after 2 straight losses</td></tr>
+        <tr><td><code>LOSS_PAUSE_SEC</code></td><td>Wait 300s (5 min) after consecutive losses</td></tr>
+        <tr><td><code>STARTING_AMOUNT_USDC</code></td><td>$2 per trade (start small!)</td></tr>
+        <tr><td><code>SOLANA_RPC_URL</code></td><td>Your Alchemy/Helius RPC endpoint</td></tr>
+        <tr><td><code>SLIPPAGE_BPS</code></td><td>150 = 1.5% slippage tolerance on swaps</td></tr>
+      </table>
+
+      <h3>3.7 Verify Your Deployment</h3>
+      <div class="code-block">ls -ltr</div>
+      <p><strong>You should see this file structure:</strong></p>
+      <div class="file-tree">
+<span class="file">requirements.txt</span>        <span class="generated">← dependency list</span>
+<span class="file">README.md</span>               <span class="generated">← documentation</span>
+<span class="file">token_scanner.py</span>        <span class="generated">← WebSocket listener</span>
+<span class="file">bot.py</span>                  <span class="generated">← main trading bot</span>
+<span class="file">.env</span>                    <span class="generated">← your config (private!)</span>
+<span class="folder">venv/</span>                   <span class="generated">← virtual environment</span>
+<span class="folder">docs/</span>                   <span class="generated">← additional documentation</span>
+      </div>
+      <p>After running the bot, these files will be auto-generated:</p>
+      <div class="file-tree">
+<span class="file">bot.log</span>                 <span class="generated">← activity log</span>
+<span class="file">journal.json</span>            <span class="generated">← trade history (JSON)</span>
+<span class="file">trade_log.csv</span>           <span class="generated">← trade history (CSV)</span>
+<span class="folder">__pycache__/</span>            <span class="generated">← Python cache (ignore)</span>
+      </div>
+      <div class="callout success">File structure matches? You're ready to test!</div>
+    </div>
+
+    <!-- STEP 4 -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-num">04</div>
+        <div class="section-title">Test the Bot</div>
+      </div>
+
+      <h3>4.1 Confirm DRY_RUN is Enabled</h3>
+      <div class="code-block">cat .env | grep DRY_RUN</div>
+      <div class="callout warning">You MUST see <code>DRY_RUN=true</code>. If it says false, run <code>nano .env</code> and fix it!</div>
+
+      <h3>4.2 Test the Token Scanner</h3>
+      <div class="code-block"><span class="comment"># Make sure venv is active</span>
+source venv/bin/activate
+
+<span class="comment"># Run the scanner</span>
+python3 token_scanner.py</div>
+      <p><strong>What you'll see:</strong></p>
+      <div class="code-block">📡 WebSocket Token Scanner — listening for new pump.fun launches...
+Will wait up to 5 minutes for a qualifying token.
+
+🚀 NEW TOKEN: EXAMPLE (Example Token)
+   Mint: AbCdEf...
+   Initial buy: 2.50 SOL
+⏳ Waiting 25s for pair data...</div>
+
+      <p>Press <strong>Ctrl + C</strong> to stop.</p>
+
+      <table>
+        <tr><th>Output</th><th>Meaning</th></tr>
+        <tr><td>"Would buy: TOKEN"</td><td>✅ Scanner found a qualifying token</td></tr>
+        <tr><td>"SKIP TOKEN: low liquidity"</td><td>✅ Working, filtering correctly</td></tr>
+        <tr><td>"No qualifying token found"</td><td>✅ Normal! Good tokens are rare</td></tr>
+        <tr><td>"Connection refused"</td><td>❌ Check internet connection</td></tr>
+        <tr><td>"ModuleNotFoundError"</td><td>❌ Activate venv and run <code>pip install -r requirements.txt</code></td></tr>
+      </table>
+
+      <h3>4.3 Test the Full Bot</h3>
+      <div class="code-block">python3 bot.py</div>
+      <p>In DRY_RUN mode: detects, scores, and filters tokens (real data), but skips actual transactions. Everything is logged.</p>
+
+      <h3>4.4 Check the Logs</h3>
+      <div class="code-block"><span class="comment"># See last 30 lines of activity</span>
+tail -30 bot.log
+
+<span class="comment"># See trade journal</span>
+cat journal.json
+
+<span class="comment"># See CSV trade log</span>
+cat trade_log.csv</div>
+
+      <h3>4.5 Run a 24-Hour Test</h3>
+      <div class="code-block"><span class="comment"># Install tmux (keeps bot running in background)</span>
+sudo apt install tmux -y
+
+<span class="comment"># Start a named session</span>
+tmux new -s bot
+
+<span class="comment"># Inside tmux:</span>
+cd ~/sniper-bot
+source venv/bin/activate
+python3 bot.py
+
+<span class="comment"># Detach (bot keeps running): press Ctrl+B, then D</span>
+<span class="comment"># Come back later: tmux attach -s bot</span></div>
+
+      <div class="callout tip">Let the bot run for at least 24 hours. Check <code>bot.log</code> periodically. You want to see it detecting tokens, scoring them, and filtering most out.</div>
+
+      <h3>4.6 Success Checklist</h3>
+      <p>After your 24-hour DRY_RUN test:</p>
+      <ul class="checklist">
+        <li>Bot stayed running without crashes</li>
+        <li><code>bot.log</code> shows tokens being detected (🚀 lines)</li>
+        <li><code>bot.log</code> shows tokens being scored and filtered</li>
+        <li><code>journal.json</code> exists and contains data</li>
+        <li><code>trade_log.csv</code> has entries</li>
+        <li>No error messages repeating continuously</li>
+        <li>WebSocket reconnected if it disconnected</li>
+      </ul>
+
+      <div class="callout success">All boxes checked? Congratulations! Your bot is validated. Proceed to Module 12 (Tuning &amp; Going Live) when ready. 🎉</div>
+    </div>
+
+    <!-- TROUBLESHOOTING -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-num">?</div>
+        <div class="section-title">Troubleshooting</div>
+      </div>
+
+      <table>
+        <tr><th>Problem</th><th>Solution</th></tr>
+        <tr><td>"Permission denied"</td><td><code>chmod +x bot.py token_scanner.py</code></td></tr>
+        <tr><td>"ModuleNotFoundError"</td><td><code>source venv/bin/activate</code> then <code>pip install -r requirements.txt</code></td></tr>
+        <tr><td>"Connection refused"</td><td>Run <code>ping google.com</code>. In VirtualBox: Settings → Network → NAT</td></tr>
+        <tr><td>Bot crashes immediately</td><td>Check <code>.env</code> for extra spaces or blank lines at the top</td></tr>
+        <tr><td>"WALLET_PRIVATE_KEY not set"</td><td>Make sure <code>.env</code> is in the same folder as <code>bot.py</code></td></tr>
+        <tr><td>VM is very slow</td><td>Increase RAM to 8192 MB and CPUs to 4 in VirtualBox Settings</td></tr>
+        <tr><td>Can't paste in terminal</td><td>Use <strong>Ctrl+Shift+V</strong> (not Ctrl+V)</td></tr>
+        <tr><td>"git: command not found"</td><td><code>sudo apt install git -y</code></td></tr>
+        <tr><td>"unzip: command not found"</td><td><code>sudo apt install unzip -y</code></td></tr>
+        <tr><td>Screen too small in VM</td><td>Install Guest Additions (Step 2.6)</td></tr>
+      </table>
+    </div>
+
+    <!-- QUICK REFERENCE -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-num">⌘</div>
+        <div class="section-title">Quick Reference</div>
+      </div>
+
+      <table>
+        <tr><th>Action</th><th>Command</th></tr>
+        <tr><td>Open terminal</td><td><code>Ctrl + Alt + T</code></td></tr>
+        <tr><td>Go to bot folder</td><td><code>cd ~/sniper-bot</code></td></tr>
+        <tr><td>Activate virtual env</td><td><code>source venv/bin/activate</code></td></tr>
+        <tr><td>Start bot</td><td><code>python3 bot.py</code></td></tr>
+        <tr><td>Start scanner only</td><td><code>python3 token_scanner.py</code></td></tr>
+        <tr><td>Stop the bot</td><td><code>Ctrl + C</code></td></tr>
+        <tr><td>View logs (last 50 lines)</td><td><code>tail -50 bot.log</code></td></tr>
+        <tr><td>View journal</td><td><code>cat journal.json</code></td></tr>
+        <tr><td>View trade CSV</td><td><code>cat trade_log.csv</code></td></tr>
+        <tr><td>Start tmux session</td><td><code>tmux new -s bot</code></td></tr>
+        <tr><td>Detach tmux</td><td><code>Ctrl+B</code>, then <code>D</code></td></tr>
+        <tr><td>Reattach tmux</td><td><code>tmux attach -s bot</code></td></tr>
+        <tr><td>Edit config</td><td><code>nano .env</code></td></tr>
+        <tr><td>Update code (git)</td><td><code>git pull</code></td></tr>
+      </table>
+    </div>
+
+    <!-- VIDEO RESOURCES -->
+    <div class="section">
+      <div class="section-header">
+        <div class="section-num">🎬</div>
+        <div class="section-title">Video Resources</div>
+      </div>
+
+      <a href="https://www.youtube.com/watch?v=Iddly8Ml3gE" target="_blank" class="video-link">
+        <div class="play-icon"></div>
+        <div class="video-info">
+          <div class="video-title">How to Install Ubuntu in VirtualBox (2026)</div>
+          <div class="video-meta">TechOpt — Full walkthrough from download to first boot</div>
+        </div>
+      </a>
+      <a href="https://www.youtube.com/watch?v=mi1uCCdvCL0" target="_blank" class="video-link">
+        <div class="play-icon"></div>
+        <div class="video-info">
+          <div class="video-title">How to Install Ubuntu Linux on VirtualBox in 2026</div>
+          <div class="video-meta">Inno Techy — Comprehensive guide including Guest Additions</div>
+        </div>
+      </a>
+      <a href="https://www.youtube.com/watch?v=IOSEdXVmmpM" target="_blank" class="video-link">
+        <div class="play-icon"></div>
+        <div class="video-info">
+          <div class="video-title">Ubuntu on VirtualBox — Step-by-Step for Beginners</div>
+          <div class="video-meta">Silent Tech — Slow-paced, perfect for absolute beginners</div>
+        </div>
+      </a>
+      <a href="https://www.youtube.com/watch?v=yjO4daXsAxg" target="_blank" class="video-link">
+        <div class="play-icon"></div>
+        <div class="video-info">
+          <div class="video-title">How to Install Python 3 on Ubuntu Linux</div>
+          <div class="video-meta">DevSecOps Club — Python + pip + venv setup</div>
+        </div>
+      </a>
+      <a href="https://learnbydoing.dev/install-ubuntu-22-04-on-a-virtual-machine-with-virtualbox/" target="_blank" class="video-link">
+        <div class="play-icon"></div>
+        <div class="video-info">
+          <div class="video-title">Written Guide: Ubuntu 22.04 on VirtualBox (Screenshots)</div>
+          <div class="video-meta">LearnByDoing.dev — Every click shown in detail</div>
+        </div>
+      </a>
+    </div>
+
+    <div class="footer">
+      <img src="https://t90152612936.p.clickup-attachments.com/t90152612936/c71ed0a2-274c-45ac-8b5e-f7abd7870796/generated-image-8bb8c92f-6c64-482a-aeb3-95c0c3650813.png?view=open" alt="IT Forest Learning Group" class="logo-footer">
+      <br>
+      <strong>IT Forest Learning Group</strong><br>
+      Course: Build a 24/7 Automated Solana Memecoin Sniper Bot with Python<br><br>
+      <em>To save as PDF: Open in browser → Ctrl+P → Save as PDF</em>
+    </div>
+
+  </div>
+
+  <script>
+    function switchMethod(id) {
+      document.querySelectorAll('.method-panel').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.method-tab').forEach(t => t.classList.remove('active'));
+      document.getElementById('method-' + id).classList.add('active');
+      event.target.classList.add('active');
+    }
+  </script>
+</body>
+</html>
