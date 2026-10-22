@@ -10,3 +10,4 @@ STARTING_AMOUNT_USDC=2
 #SOLANA_RPC_URL=https://api.mainnet-beta.solana.com 
 SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=912f15e8-7392-490f-aa08-b12275aca7f5
 SLIPPAGE_BPS=150
+BIRDEYE_API_KEY=5f25d86cdcf543a6b3d66561bcb5aa60
