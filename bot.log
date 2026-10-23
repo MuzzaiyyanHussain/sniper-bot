@@ -1,0 +1,60 @@
+2026-10-23 22:37:05,935 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-23 22:37:05,955 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-23 22:37:05,956 [INFO] 
+============================================================
+2026-10-23 22:37:05,957 [INFO]   CYCLE 1 | Playing $2.0000 USDC | Consec losses: 0
+2026-10-23 22:37:05,957 [INFO] ============================================================
+2026-10-23 22:37:05,957 [INFO] 🔍 Dry-run mode: scanning without checking wallet balances.
+2026-10-23 22:37:05,957 [INFO] 🔍 Scanning for best new token launch...
+2026-10-23 22:37:05,959 [INFO] 
+  ✅ Cycle 1 (TARGET) — TEST
+2026-10-23 22:37:05,959 [INFO]      Played:     $2.0000 USDC
+2026-10-23 22:37:05,960 [INFO]      Received:   $8.0000 USDC  (+300.0%)
+2026-10-23 22:37:05,960 [INFO]      Saved:      $3.2000 USDC  (total: $3.2000)
+2026-10-23 22:37:05,960 [INFO]      Next play:  $4.8000 USDC
+2026-10-23 22:37:05,960 [INFO]      Consec losses: 0
+2026-10-23 22:38:05,203 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-23 22:38:05,204 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-23 22:38:05,205 [INFO] 
+============================================================
+2026-10-23 22:38:05,205 [INFO]   CYCLE 2 | Playing $4.8000 USDC | Consec losses: 0
+2026-10-23 22:38:05,205 [INFO] ============================================================
+2026-10-23 22:38:05,205 [INFO] 🔍 Dry-run mode: scanning without checking wallet balances.
+2026-10-23 22:38:05,205 [INFO] 🔍 Scanning for best new token launch...
+2026-10-23 22:38:05,207 [INFO] 
+  ✅ Cycle 2 (TARGET) — TEST
+2026-10-23 22:38:05,208 [INFO]      Played:     $4.8000 USDC
+2026-10-23 22:38:05,208 [INFO]      Received:   $8.0000 USDC  (+66.7%)
+2026-10-23 22:38:05,208 [INFO]      Saved:      $3.2000 USDC  (total: $6.4000)
+2026-10-23 22:38:05,208 [INFO]      Next play:  $4.8000 USDC
+2026-10-23 22:38:05,208 [INFO]      Consec losses: 0
+2026-10-23 22:41:16,652 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-23 22:41:16,652 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-23 22:41:16,653 [INFO] 
+============================================================
+2026-10-23 22:41:16,653 [INFO]   CYCLE 3 | Playing $4.8000 USDC | Consec losses: 0
+2026-10-23 22:41:16,654 [INFO] ============================================================
+2026-10-23 22:41:16,654 [INFO] 🔍 Dry-run mode: scanning without checking wallet balances.
+2026-10-23 22:41:16,654 [INFO] 🔍 Scanning for best new token launch...
+2026-10-23 22:41:16,659 [INFO] 
+  ✅ Cycle 3 (TARGET) — TEST
+2026-10-23 22:41:16,659 [INFO]      Played:     $4.8000 USDC
+2026-10-23 22:41:16,659 [INFO]      Received:   $8.0000 USDC  (+66.7%)
+2026-10-23 22:41:16,660 [INFO]      Saved:      $3.2000 USDC  (total: $9.6000)
+2026-10-23 22:41:16,660 [INFO]      Next play:  $4.8000 USDC
+2026-10-23 22:41:16,660 [INFO]      Consec losses: 0
+2026-10-23 22:42:29,006 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-23 22:42:29,007 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-23 22:42:29,007 [INFO] 
+============================================================
+2026-10-23 22:42:29,008 [INFO]   CYCLE 4 | Playing $4.8000 USDC | Consec losses: 0
+2026-10-23 22:42:29,008 [INFO] ============================================================
+2026-10-23 22:42:29,008 [INFO] 🔍 Dry-run mode: scanning without checking wallet balances.
+2026-10-23 22:42:29,008 [INFO] 🔍 Scanning for best new token launch...
+2026-10-23 22:42:29,010 [INFO] 
+  ✅ Cycle 4 (TARGET) — TEST
+2026-10-23 22:42:29,010 [INFO]      Played:     $4.8000 USDC
+2026-10-23 22:42:29,010 [INFO]      Received:   $8.0000 USDC  (+66.7%)
+2026-10-23 22:42:29,010 [INFO]      Saved:      $3.2000 USDC  (total: $12.8000)
+2026-10-23 22:42:29,011 [INFO]      Next play:  $4.8000 USDC
+2026-10-23 22:42:29,011 [INFO]      Consec losses: 0

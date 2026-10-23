@@ -4,7 +4,7 @@ Jupiter.ag Compounding Strategy Bot
 Strategy: Scan for new token launches → buy via Jupiter → poll price
 → sell at 2x → save 40% → reinvest 60% → repeat.
 
-Requirements: pip install solders requests python-dotenv base58
+Requirements: pip install solders requests python-dotenv base58 websockets
 """
 
 import os
@@ -261,15 +261,17 @@ class PriceOracle:
         """
         try:
             pairs = self.dex.get_pairs_for_mint(token_mint)
-            sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+            sol_pairs = [
+                p for p in pairs
+                if p.get("chainId") == "solana"
+                and (p.get("baseToken", {}).get("address") or "").lower() == token_mint.lower()
+            ]
             if sol_pairs:
                 best = max(sol_pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
                 price = float(best.get("priceUsd") or 0)
                 liquidity = float(best.get("liquidity", {}).get("usd") or 0)
                 if price > 0:
                     return price, liquidity
-                # DexScreener returned a pair but no usable price — pool is
-                # likely drained. Trust the liquidity reading (0) either way.
                 return 0.0, liquidity
         except Exception as e:
             log.debug(f"DexScreener price lookup failed for {token_mint[:8]}: {e}")
@@ -345,8 +347,8 @@ class Journal:
 
     def _load(self) -> dict:
         if os.path.exists(self.FILE):
-            data = json.load(open(self.FILE))
-            # Ensure consec_losses key exists in older journals
+            with open(self.FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
             if "consec_losses" not in data:
                 data["consec_losses"] = 0
             return data
@@ -365,7 +367,7 @@ class Journal:
             json.dump(self.data, f, indent=2)
 
     def log_cycle(self, cycle_data: dict):
-        ts = datetime.utcnow().isoformat()
+        ts = datetime.now().astimezone().isoformat()
         self.data["history"].append({**cycle_data, "ts": ts})
         self.save()
         self.append_csv({**cycle_data, "datetime": ts})
@@ -383,12 +385,17 @@ class CompoundingBot:
         self.j      = Journal()
         self.scanner = TokenScanner(ScannerConfig())
 
-        if not cfg.WALLET_PRIVATE_KEY:
-            raise ValueError("WALLET_PRIVATE_KEY not set in .env")
-        pk_bytes     = base58.b58decode(cfg.WALLET_PRIVATE_KEY)
-        self.keypair = Keypair.from_bytes(pk_bytes)
-        self.pubkey  = str(self.keypair.pubkey())
-        log.info(f"Wallet loaded: {self.pubkey}")
+        if self.cfg.DRY_RUN:
+            self.keypair = None
+            self.pubkey = "DRY_RUN"
+            log.info("Wallet disabled for dry-run mode; no live key material required.")
+        else:
+            if not cfg.WALLET_PRIVATE_KEY:
+                raise ValueError("WALLET_PRIVATE_KEY not set in .env")
+            pk_bytes = base58.b58decode(cfg.WALLET_PRIVATE_KEY)
+            self.keypair = Keypair.from_bytes(pk_bytes)
+            self.pubkey = str(self.keypair.pubkey())
+            log.info(f"Wallet loaded: {self.pubkey}")
 
         if self.j.data["play_amount_usdc"] is None:
             self.j.data["play_amount_usdc"] = cfg.STARTING_AMOUNT_USDC
@@ -467,16 +474,24 @@ class CompoundingBot:
 
     # ── Buy ───────────────────────────────────────────────────────────────────
     def execute_buy(self, usdc_amount: float, token: TokenCandidate) -> dict | None:
+        if usdc_amount <= 0:
+            raise ValueError("Buy amount must be positive")
+        if token is None or not getattr(token, "mint", None):
+            raise ValueError("Token candidate is missing a mint address")
+
         log.info(f"📥 BUY  ${usdc_amount:.4f} USDC → {token.symbol} ({token.mint[:8]}...)")
 
-        amount_lam     = usdc_to_lamports(usdc_amount)
-        quote          = self.jup.get_quote(self.cfg.INPUT_MINT, token.mint, amount_lam)
-        out_amount     = int(quote["outAmount"])
+        amount_lam = usdc_to_lamports(usdc_amount)
+        quote = self.jup.get_quote(self.cfg.INPUT_MINT, token.mint, amount_lam)
+        out_amount = int(quote["outAmount"])
         token_decimals = self.oracle.get_token_decimals(token.mint)
-        token_amount   = out_amount / (10 ** token_decimals)
-        entry_price    = usdc_amount / token_amount if token_amount else 0
-        target_price   = entry_price * self.cfg.PRICE_TARGET_MULT
-        stop_price     = entry_price * self.cfg.STOP_LOSS_MULT if self.cfg.STOP_LOSS_MULT > 0 else 0
+        token_amount = out_amount / (10 ** token_decimals)
+        if token_amount <= 0:
+            log.error(f"   Quote produced zero tokens for {token.symbol}; aborting.")
+            return None
+        entry_price = usdc_amount / token_amount if token_amount else 0
+        target_price = entry_price * self.cfg.PRICE_TARGET_MULT
+        stop_price = entry_price * self.cfg.STOP_LOSS_MULT if self.cfg.STOP_LOSS_MULT > 0 else 0
 
         log.info(f"   Got:    {token_amount:.6f} {token.symbol}")
         log.info(f"   Entry:  ${entry_price:.8f}")
@@ -488,23 +503,23 @@ class CompoundingBot:
             sig = "DRY_RUN_BUY"
         else:
             raw_tx = self.jup.build_swap_transaction(quote, self.pubkey)
-            sig    = self.jup.sign_and_send(raw_tx, self.keypair)
+            sig = self.jup.sign_and_send(raw_tx, self.keypair)
             log.info(f"   TX: https://solscan.io/tx/{sig}")
             if not self.jup.confirm_transaction(sig):
                 log.error("Buy TX not confirmed — aborting cycle.")
                 return None
 
         position = {
-            "buy_tx":         sig,
-            "usdc_spent":     usdc_amount,
-            "token_amount":   token_amount,
+            "buy_tx": sig,
+            "usdc_spent": usdc_amount,
+            "token_amount": token_amount,
             "token_decimals": token_decimals,
-            "token_symbol":   token.symbol,
-            "entry_price":    entry_price,
-            "target_price":   target_price,
-            "stop_price":     stop_price,
-            "token_mint":     token.mint,
-            "dex_url":        token.url,
+            "token_symbol": token.symbol,
+            "entry_price": entry_price,
+            "target_price": target_price,
+            "stop_price": stop_price,
+            "token_mint": token.mint,
+            "dex_url": token.url,
         }
         self.j.data["open_position"] = position
         self.j.save()
@@ -512,34 +527,27 @@ class CompoundingBot:
 
     # ── Sell ──────────────────────────────────────────────────────────────────
     def execute_sell(self, position: dict, reason: str = "target") -> float | None:
-        token_amount   = position["token_amount"]
-        token_mint     = position["token_mint"]
+        token_amount = position["token_amount"]
+        token_mint = position["token_mint"]
         token_decimals = position.get("token_decimals", 6)
-        symbol         = position.get("token_symbol", "TOKEN")
-        usdc_spent     = position.get("usdc_spent", 0)
+        symbol = position.get("token_symbol", "TOKEN")
+        usdc_spent = position.get("usdc_spent", 0)
+
+        if token_amount <= 0:
+            raise ValueError("Sell amount must be positive")
 
         log.info(f"📤 SELL {token_amount:.6f} {symbol} → USDC ({reason})")
 
         amount_lam = int(token_amount * (10 ** token_decimals))
 
-        # ── Dead-pool short-circuit ───────────────────────────────────────────
-        # DexScreener already told us this pool has effectively no liquidity.
-        # Don't waste 3-5 escalating-slippage calls to Jupiter — that can't
-        # fix a "no route exists" problem. Do exactly ONE high-slippage probe
-        # (Jupiter aggregates across DEXs and can occasionally route through
-        # a pool DexScreener isn't tracking as the "main" pair), then stop
-        # and alert clearly rather than looping every cycle.
         if reason == "zero_liquidity":
-            log.warning("   Pool liquidity is effectively $0 — probing Jupiter once "
-                        "for an alternate route before giving up...")
+            log.warning("   Pool liquidity is effectively $0 — probing Jupiter once for an alternate route before giving up...")
             try:
                 probe_quote = self.jup.get_quote(
                     token_mint, self.cfg.INPUT_MINT, amount_lam, slippage_bps=2000
                 )
                 usdc_out = int(probe_quote["outAmount"]) / (10 ** USDC_DECIMALS)
                 log.info(f"   ✅ Found a route after all — quote: ${usdc_out:.4f} USDC. Proceeding to sell.")
-                # A route exists — fall through to the normal sell flow below
-                # using this same reason, but restrict to a single attempt.
                 slippage_schedule = [2000]
             except Exception as e:
                 log.error(f"   ❌ No route found via Jupiter either: {e}")
@@ -553,24 +561,13 @@ class CompoundingBot:
                 self.j.data["open_position"] = position
                 self.j.save()
                 return None
-        else:
-            slippage_schedule = None  # set below
-
-        # ── Escalating slippage schedule ─────────────────────────────────────
-        # Stop-loss exits MUST get out regardless of price impact — a crashed
-        # token with near-zero pool liquidity will keep rejecting sells with
-        # Custom 6024 (SlippageToleranceExceeded) if we only try one slippage
-        # level. We escalate up to 50% before giving up.
-        # Target exits use a tighter schedule since we have a good price.
-        if slippage_schedule is not None:
-            pass  # already set by the zero-liquidity probe-success branch above
         elif reason == "stop_loss":
             slippage_schedule = [
-                self.cfg.SLIPPAGE_BPS,  # 150bps (from .env)
-                500,                     # 5%
-                1000,                    # 10%
-                3000,                    # 30%
-                5000,                    # 50% — last resort
+                self.cfg.SLIPPAGE_BPS,
+                500,
+                1000,
+                3000,
+                5000,
             ]
         else:
             slippage_schedule = [
@@ -580,8 +577,7 @@ class CompoundingBot:
             ]
 
         for attempt, slippage in enumerate(slippage_schedule, 1):
-            log.info(f"   Attempt {attempt}/{len(slippage_schedule)} "
-                     f"(slippage={slippage}bps = {slippage/100:.1f}%)")
+            log.info(f"   Attempt {attempt}/{len(slippage_schedule)} (slippage={slippage}bps = {slippage/100:.1f}%)")
             try:
                 quote = self.jup.get_quote(
                     token_mint, self.cfg.INPUT_MINT, amount_lam,
@@ -598,7 +594,6 @@ class CompoundingBot:
             usdc_out = int(quote["outAmount"]) / (10 ** USDC_DECIMALS)
             log.info(f"   Quote: ${usdc_out:.4f} USDC")
 
-            # On target exits, skip if quote is suspiciously low
             if reason == "target" and usdc_spent > 0 and attempt == 1:
                 if usdc_out < usdc_spent * 0.50:
                     log.warning(
@@ -616,12 +611,12 @@ class CompoundingBot:
 
             try:
                 raw_tx = self.jup.build_swap_transaction(quote, self.pubkey)
-                sig    = self.jup.sign_and_send(raw_tx, self.keypair)
+                sig = self.jup.sign_and_send(raw_tx, self.keypair)
                 log.info(f"   TX: https://solscan.io/tx/{sig}")
             except RuntimeError as e:
                 log.error(f"   ❌ Send failed: {e}")
                 if attempt < len(slippage_schedule):
-                    log.info(f"   Retrying with higher slippage...")
+                    log.info("   Retrying with higher slippage...")
                     time.sleep(2)
                     continue
                 log.error("   All attempts exhausted. Sell manually on jup.ag.")
@@ -631,13 +626,12 @@ class CompoundingBot:
                 self.j.data["open_position"] = None
                 self.j.save()
                 return usdc_out
-            else:
-                log.error(f"   Sell not confirmed (attempt {attempt})")
-                if attempt < len(slippage_schedule):
-                    time.sleep(2)
-                    continue
-                log.error("   All attempts failed. Sell manually on jup.ag.")
-                return None
+            log.error(f"   Sell not confirmed (attempt {attempt})")
+            if attempt < len(slippage_schedule):
+                time.sleep(2)
+                continue
+            log.error("   All attempts failed. Sell manually on jup.ag.")
+            return None
 
         log.error("   Sell failed after all attempts. Sell manually on jup.ag.")
         return None
@@ -782,13 +776,11 @@ class CompoundingBot:
 
     # ── Cycle ─────────────────────────────────────────────────────────────────
     def run_cycle(self) -> bool:
-        # ── Play amount floor reset ───────────────────────────────────────────
-        # If the play amount has fallen below MIN_PLAY_AMOUNT (e.g. after a
-        # catastrophic opening loss like USWR's -86.2%), reset to starting
-        # amount so the strategy can still compound meaningfully.
-        # Without this, a single bad first trade can permanently cripple
-        # all future cycles even when win rate and win size are healthy.
         play_amount = self.j.data["play_amount_usdc"]
+        if play_amount is None:
+            play_amount = self.cfg.STARTING_AMOUNT_USDC
+            self.j.data["play_amount_usdc"] = play_amount
+
         if play_amount < self.cfg.MIN_PLAY_AMOUNT and not self.j.data.get("open_position"):
             log.warning(
                 f"⚠️  Play amount ${play_amount:.6f} below floor "
@@ -800,7 +792,6 @@ class CompoundingBot:
             self.j.data["consec_losses"] = 0
             self.j.save()
 
-        # ── Consecutive loss pause ────────────────────────────────────────────
         consec = self.j.data.get("consec_losses", 0)
         if consec >= self.cfg.MAX_CONSEC_LOSSES and not self.j.data.get("open_position"):
             log.warning(
@@ -820,12 +811,12 @@ class CompoundingBot:
         position = self.j.data.get("open_position")
 
         if not position:
-            # Balance check before buying
-            if not self.check_balances(play_amount):
+            if self.cfg.DRY_RUN:
+                log.info("🔍 Dry-run mode: scanning without checking wallet balances.")
+            elif not self.check_balances(play_amount):
                 log.error("❌ Insufficient funds. Top up wallet and restart.")
                 sys.exit(1)
 
-            # Select token
             if self.cfg.TOKEN_MODE == "scan":
                 log.info("🔍 Scanning for best new token launch...")
                 token = self.scanner.find_best(max_wait_minutes=self.cfg.SCAN_MAX_WAIT_MIN)
@@ -854,16 +845,16 @@ class CompoundingBot:
         win = reason == "target"
         if win:
             next_play = usdc_received * self.cfg.REINVEST_PCT
-            saved     = usdc_received * self.cfg.SAVE_PCT
+            saved = usdc_received * self.cfg.SAVE_PCT
             self.j.data["consec_losses"] = 0
         else:
             next_play = usdc_received
-            saved     = 0.0
+            saved = 0.0
             self.j.data["consec_losses"] = self.j.data.get("consec_losses", 0) + 1
 
-        self.j.data["cycle"]               = cycle
-        self.j.data["play_amount_usdc"]    = next_play
-        self.j.data["total_saved_usdc"]   += saved
+        self.j.data["cycle"] = cycle
+        self.j.data["play_amount_usdc"] = next_play
+        self.j.data["total_saved_usdc"] += saved
         self.j.data["total_winnings_usdc"] += usdc_received
 
         pct = (usdc_received / play_amount - 1) * 100 if play_amount > 0 else 0
