@@ -7,7 +7,7 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-from bot import CompoundingBot, Config, Journal, StrategyCalc, parse_bool_env
+from bot import CompoundingBot, Config, Journal, PriceOracle, StrategyCalc, parse_bool_env
 from token_scanner import (
     PumpFunListener,
     RugDetector,
@@ -286,6 +286,84 @@ class TestScannerFiltersAndMintMatching(unittest.TestCase):
             )
             parse_pair.assert_called_once_with(
                 pair, None, expected_mint="MintX"
+            )
+
+
+class TestPriceOracleValidation(unittest.TestCase):
+    def setUp(self):
+        self.cfg = Config()
+        self.oracle = PriceOracle(self.cfg)
+        self.oracle.dex = MagicMock()
+
+    def pair(self, price="0.001", liquidity=10_000):
+        return {
+            "chainId": "solana",
+            "baseToken": {"address": "MintX"},
+            "priceUsd": price,
+            "liquidity": {"usd": liquidity},
+        }
+
+    def test_valid_dex_pair_returns_price_and_liquidity(self):
+        self.oracle.dex.get_pairs_for_mint.return_value = [
+            self.pair(price="0.001", liquidity=5000)
+        ]
+        self.assertEqual(
+            self.oracle.get_price_and_liquidity("MintX"),
+            (0.001, 5000.0),
+        )
+
+    def test_non_finite_dex_prices_are_rejected(self):
+        for price in ("NaN", "Infinity", "-Infinity"):
+            with self.subTest(price=price):
+                self.oracle.dex.get_pairs_for_mint.return_value = [
+                    self.pair(price=price)
+                ]
+                self.assertEqual(
+                    self.oracle.get_price_and_liquidity("MintX"),
+                    (0.0, 10_000.0),
+                )
+
+    def test_non_finite_or_negative_liquidity_is_rejected(self):
+        for liquidity in (float("nan"), float("inf"), -1):
+            with self.subTest(liquidity=liquidity):
+                self.oracle.dex.get_pairs_for_mint.return_value = [
+                    self.pair(liquidity=liquidity)
+                ]
+                self.assertEqual(
+                    self.oracle.get_price_and_liquidity("MintX"),
+                    (0.0, None),
+                )
+
+    def test_invalid_dex_liquidity_does_not_use_jupiter_fallback(self):
+        self.oracle.dex.get_pairs_for_mint.return_value = [
+            self.pair(liquidity=float("nan"))
+        ]
+        with patch("bot.JupiterClient") as jupiter:
+            self.assertEqual(
+                self.oracle.get_price_and_liquidity("MintX"),
+                (0.0, None),
+            )
+            jupiter.assert_not_called()
+
+    def test_zero_jupiter_output_is_rejected(self):
+        self.oracle.dex.get_pairs_for_mint.return_value = []
+        with patch("bot.JupiterClient") as jupiter:
+            jupiter.return_value.get_quote.return_value = {"outAmount": "0"}
+            self.assertEqual(
+                self.oracle.get_price_and_liquidity("MintX"),
+                (0.0, None),
+            )
+
+    def test_valid_jupiter_fallback_keeps_liquidity_unknown(self):
+        self.oracle.dex.get_pairs_for_mint.return_value = []
+        with patch("bot.JupiterClient") as jupiter:
+            jupiter.return_value.get_quote.return_value = {
+                "outAmount": "1000000000"
+            }
+            self.oracle.get_token_decimals = MagicMock(return_value=6)
+            self.assertEqual(
+                self.oracle.get_price_and_liquidity("MintX"),
+                (0.001, None),
             )
 
 

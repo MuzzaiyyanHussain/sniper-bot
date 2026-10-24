@@ -8,6 +8,7 @@ Requirements: pip install solders requests python-dotenv base58 websockets
 """
 
 import os
+import math
 import sys
 import time
 import json
@@ -260,49 +261,72 @@ class PriceOracle:
         return 6
 
     def get_price_and_liquidity(self, token_mint: str) -> tuple[float, float | None]:
-        """Return (price_usd, liquidity_usd) for a token.
+        """Return a validated (price_usd, liquidity_usd) pair.
 
-        Primary source: DexScreener — same source already used for token
-        discovery in token_scanner.py, so it's consistent and (unlike the
-        old Birdeye call, which had no API key configured and was silently
-        failing every request) it actually works and gives us real pool
-        liquidity, not just a price.
-
-        liquidity_usd is None only if DexScreener couldn't be reached at all
-        (network error) — as opposed to 0.0, which means DexScreener *was*
-        reached and reports the pool has no liquidity. Callers should treat
-        None cautiously (retry) and 0.0/low values as a real dead-pool signal.
+        Invalid numeric data fails closed. Jupiter can provide a price fallback
+        only when DexScreener has no matching Solana pair; its liquidity remains
+        unknown (None), never implicitly healthy.
         """
         try:
             pairs = self.dex.get_pairs_for_mint(token_mint)
             sol_pairs = [
                 p for p in pairs
-                if p.get("chainId") == "solana"
-                and (p.get("baseToken", {}).get("address") or "").lower() == token_mint.lower()
+                if isinstance(p, dict)
+                and p.get("chainId") == "solana"
+                and isinstance(p.get("baseToken"), dict)
+                and (p["baseToken"].get("address") or "").lower() == token_mint.lower()
             ]
-            if sol_pairs:
-                best = max(sol_pairs, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
-                price = float(best.get("priceUsd") or 0)
-                liquidity = float(best.get("liquidity", {}).get("usd") or 0)
-                if price > 0:
-                    return price, liquidity
-                return 0.0, liquidity
         except Exception as e:
             log.debug(f"DexScreener price lookup failed for {token_mint[:8]}: {e}")
+            sol_pairs = []
 
-        # Fallback: Jupiter quote — only used if DexScreener has no pair data
-        # at all (e.g. brand new pool not yet indexed). Liquidity is unknown
-        # here, so we return None for it rather than pretending it's healthy.
+        if sol_pairs:
+            valid_pairs = []
+            for pair in sol_pairs:
+                try:
+                    liquidity_data = pair.get("liquidity")
+                    liquidity_raw = liquidity_data.get("usd") if isinstance(liquidity_data, dict) else 0
+                    liquidity = float(liquidity_raw or 0)
+                    if not math.isfinite(liquidity) or liquidity < 0:
+                        continue
+                    valid_pairs.append((liquidity, pair))
+                except (TypeError, ValueError, OverflowError):
+                    continue
+
+            if not valid_pairs:
+                log.warning(f"Invalid DexScreener liquidity for {token_mint[:8]}; rejecting price.")
+                return 0.0, None
+
+            liquidity, best = max(valid_pairs, key=lambda item: item[0])
+            try:
+                price = float(best.get("priceUsd") or 0)
+            except (TypeError, ValueError, OverflowError):
+                price = 0.0
+
+            if not math.isfinite(price) or price <= 0:
+                log.warning(f"Invalid DexScreener price for {token_mint[:8]}; rejecting price.")
+                return 0.0, liquidity
+            return price, liquidity
+
+        # Fallback is for a mint not yet indexed by DexScreener. Liquidity
+        # is unknown, so callers must not treat this as evidence of a healthy pool.
         try:
             jup = JupiterClient(self.cfg)
             quote = jup.get_quote(self.cfg.INPUT_MINT, token_mint, usdc_to_lamports(1.0))
-            out_amount      = int(quote["outAmount"])
-            token_decimals  = self.get_token_decimals(token_mint)
-            tokens_per_usdc = out_amount / (10 ** token_decimals)
-            price = 1.0 / tokens_per_usdc if tokens_per_usdc else 0.0
+            out_amount = int(quote["outAmount"])
+            if out_amount <= 0:
+                return 0.0, None
 
-            if price > 0 and (price > 1_000_000 or price < 1e-15):
-                log.warning(f"   ⚠️  Implausible price for {token_mint[:8]}: ${price}. Discarding.")
+            token_decimals = self.get_token_decimals(token_mint)
+            if not isinstance(token_decimals, int) or not 0 <= token_decimals <= 18:
+                log.warning(f"Invalid token decimals for {token_mint[:8]}; rejecting Jupiter price.")
+                return 0.0, None
+
+            tokens_per_usdc = out_amount / (10 ** token_decimals)
+            price = 1.0 / tokens_per_usdc if tokens_per_usdc > 0 else 0.0
+
+            if not math.isfinite(price) or price <= 0 or price > 1_000_000 or price < 1e-15:
+                log.warning(f"Invalid or implausible Jupiter price for {token_mint[:8]}; discarding.")
                 return 0.0, None
             return price, None
         except Exception as e:
