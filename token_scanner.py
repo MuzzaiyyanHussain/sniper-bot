@@ -8,6 +8,7 @@ Falls back to DexScreener polling if WebSocket is unavailable.
 
 import time
 import math
+import re
 import asyncio
 import logging
 import json
@@ -16,6 +17,25 @@ import websockets
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
+
+
+def parse_sol_amount(event: dict, max_reasonable_sol: float = 1_000.0) -> float | None:
+    """Return the documented SOL-spend field, or None when it is absent.
+
+    PumpPortal's `initialBuy` is a token amount, not SOL. This function never
+    falls back to it. Invalid supplied values raise ValueError so callers can
+    skip that event rather than silently trusting a zero.
+    """
+    raw = event.get("solAmount")
+    if raw is None:
+        return None
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid solAmount: {raw!r}") from exc
+    if not math.isfinite(amount) or amount < 0 or amount > max_reasonable_sol:
+        raise ValueError(f"implausible solAmount: {raw!r}")
+    return amount
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -97,7 +117,7 @@ class TokenCandidate:
     top10_pct:       float = 0.0
     score:           float = 0.0
     url:             str   = ""
-    initial_buy_sol: float = 0.0   # dev's initial buy at launch
+    initial_buy_sol: float | None = None   # SOL spent by creator, if supplied by the event
 
     @property
     def buy_sell_ratio(self) -> float:
@@ -171,14 +191,15 @@ class TokenScorer:
         elif 50_000 < t.liquidity_usd <= 200_000:
             s += 10
 
-        # Initial buy check (0-10)
-        # Small initial buy = fairer launch
-        if t.initial_buy_sol == 0 or t.initial_buy_sol < 1:
-            s += 10
-        elif t.initial_buy_sol < 5:
-            s += 6
-        elif t.initial_buy_sol < 20:
-            s += 3
+        # Initial buy check (0-10). Unknown is neutral: do not treat missing
+        # event data as a zero-SOL creator buy.
+        if t.initial_buy_sol is not None:
+            if t.initial_buy_sol < 1:
+                s += 10
+            elif t.initial_buy_sol < 5:
+                s += 6
+            elif t.initial_buy_sol < 20:
+                s += 3
 
         return round(s, 2)
 
@@ -205,7 +226,7 @@ class DexScreenerClient:
             log.debug(f"DexScreener error for {mint[:8]}: {e}")
             return []
 
-    def parse_pair(self, pair: dict, initial_buy_sol: float = 0, expected_mint: str | None = None) -> "TokenCandidate | None":
+    def parse_pair(self, pair: dict, initial_buy_sol: float | None = None, expected_mint: str | None = None) -> "TokenCandidate | None":
         try:
             if pair.get("chainId") != "solana":
                 return None
@@ -289,12 +310,13 @@ class PumpFunListener:
             return False, f"sell pressure ({t.buy_sell_ratio:.1f}x)"
         if t.dex not in cfg.allowed_dexes:
             return False, f"unknown dex ({t.dex})"
-        if t.initial_buy_sol > cfg.max_initial_buy_sol:
+        if (t.initial_buy_sol is not None
+                and t.initial_buy_sol > cfg.max_initial_buy_sol):
             return False, f"dev bought too much ({t.initial_buy_sol:.1f} SOL)"
         return True, ""
 
     def _evaluate_mint(self, mint: str, name: str, symbol: str,
-                       initial_buy_sol: float) -> "TokenCandidate | None":
+                       initial_buy_sol: float | None) -> "TokenCandidate | None":
         """
         Wait for DexScreener to index the pair, then evaluate.
         Called after WebSocket notifies us of a new token.
@@ -343,78 +365,106 @@ class PumpFunListener:
 
     async def _listen_ws(self, endpoint: str, result_queue: asyncio.Queue,
                          stop_event: asyncio.Event):
-        """Connect to WebSocket and push qualifying tokens to queue."""
+        """Connect to PumpPortal and evaluate new-token events concurrently."""
         log.info(f"📡 Connecting to {endpoint}...")
+        if not hasattr(self, "_pending_mints"):
+            self._pending_mints = set()
+            self._eval_semaphore = asyncio.Semaphore(self.cfg.max_parallel_evaluations)
+            self._eval_tasks = set()
+
         try:
             async with websockets.connect(endpoint, ping_interval=20,
-                                         ping_timeout=10) as ws:
+                                          ping_timeout=10) as ws:
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 log.info("   ✅ Subscribed to new token launches")
 
                 while not stop_event.is_set():
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=30)
-                        data = json.loads(msg)
-
-                        tx_type = data.get("txType") or data.get("type", "")
-                        mint = data.get("mint") or data.get("address", "")
-                        name = data.get("name", "Unknown")
-                        symbol = data.get("symbol", "???")
-                        sol_amt = float(data.get("solAmount") or data.get("initialBuy", 0) or 0)
-
-                        if not mint:
-                           continue
-
-                        if tx_type in ("create", "mint", "") or "mint" in data:
-                           log.info(f"\n🚀 NEW TOKEN: {symbol} ({name})")
-                           log.info(f"   Mint:        {mint}")
-                           log.info(f"   Initial buy: {sol_amt:.2f} SOL")
-
-                           if not hasattr(self, "_pending_mints"):
-                               self._pending_mints = set()
-                               self._eval_semaphore = asyncio.Semaphore(self.cfg.max_parallel_evaluations)
-                               self._eval_tasks = set()
-
-                           if mint in self._pending_mints:
-                               continue
-
-                           self._pending_mints.add(mint)
-
-                           async def evaluate_and_queue(token_mint, token_name, token_symbol, token_sol_amt):
-                               try:
-                                   async with self._eval_semaphore:
-                                       if stop_event.is_set():
-                                           return
-                                       loop = asyncio.get_running_loop()
-                                       candidate = await loop.run_in_executor(
-                                           None,
-                                           self._evaluate_mint,
-                                           token_mint,
-                                           token_name,
-                                           token_symbol,
-                                           token_sol_amt,
-                                       )
-                                       if candidate and not stop_event.is_set():
-                                           await result_queue.put(candidate)
-                               except Exception:
-                                   log.exception("Token evaluation failed for %s", token_mint)
-                               finally:
-                                   self._pending_mints.discard(token_mint)
-
-                           task = asyncio.create_task(
-                               evaluate_and_queue(mint, name, symbol, sol_amt)
-                           )
-                           self._eval_tasks.add(task)
-                           task.add_done_callback(self._eval_tasks.discard)
-
                     except asyncio.TimeoutError:
                         await ws.ping()
-                    except Exception as e:
-                        log.warning(f"   WS message error: {e}")
-                        break
+                        continue
 
+                    try:
+                        data = json.loads(msg)
+                        if not isinstance(data, dict):
+                            raise ValueError("WebSocket event must be a JSON object")
+                        tx_type = data.get("txType") or data.get("type", "")
+                        mint = data.get("mint") or data.get("address", "")
+                        name = str(data.get("name") or "Unknown")
+                        symbol = str(data.get("symbol") or "???")
+                        if not isinstance(mint, str) or not mint.strip():
+                            log.debug("Skipping WebSocket event without a mint")
+                            continue
+
+                        # PumpPortal's creation event uses `initialBuy` for the
+                        # token amount and `solAmount` for SOL spent. Never use
+                        # initialBuy as a SOL fallback. Missing solAmount remains
+                        # unknown; malformed or absurd values reject this event.
+                        try:
+                            sol_amt = parse_sol_amount(data)
+                        except ValueError as e:
+                            log.warning("Skipping %s: %s", symbol, e)
+                            continue
+
+                        if not (tx_type in ("create", "mint", "") or "mint" in data):
+                            continue
+
+                        log.info("\n🚀 NEW TOKEN: %s (%s)", symbol, name)
+                        log.info("   Mint:        %s", mint)
+                        if sol_amt is None:
+                            log.info("   Initial buy: unknown (solAmount not supplied)")
+                        else:
+                            log.info("   Initial buy: %.4f SOL", sol_amt)
+
+                        if mint in self._pending_mints:
+                            continue
+                        self._pending_mints.add(mint)
+
+                        async def evaluate_and_queue(token_mint, token_name, token_symbol, token_sol_amt):
+                            try:
+                                async with self._eval_semaphore:
+                                    if stop_event.is_set():
+                                        return
+                                    loop = asyncio.get_running_loop()
+                                    candidate = await loop.run_in_executor(
+                                        None, self._evaluate_mint, token_mint, token_name,
+                                        token_symbol, token_sol_amt,
+                                    )
+                                    if candidate and not stop_event.is_set():
+                                        await result_queue.put(candidate)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                log.exception("Token evaluation failed for %s", token_mint)
+                            finally:
+                                self._pending_mints.discard(token_mint)
+
+                        task = asyncio.create_task(
+                            evaluate_and_queue(mint, name, symbol, sol_amt)
+                        )
+                        self._eval_tasks.add(task)
+                        task.add_done_callback(self._eval_tasks.discard)
+                    except (json.JSONDecodeError, ValueError, TypeError) as e:
+                        # Bad individual messages must not tear down the socket.
+                        log.warning("Skipping malformed WebSocket message: %s", e)
+                    except Exception as e:
+                        log.warning("   WS message processing error: %s", e)
+
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            log.warning(f"   WS connection failed ({endpoint}): {e}")
+            log.warning("   WS connection failed (%s): %s", endpoint, e)
+        finally:
+            # When the scan ends, stop async evaluations and wait for them. Any
+            # executor work already running cannot be forcibly killed; the pair
+            # lookup itself has bounded request/retry timeouts.
+            if stop_event.is_set():
+                tasks = list(getattr(self, "_eval_tasks", set()))
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _listen_with_fallback(self, result_queue: asyncio.Queue,
                                     stop_event: asyncio.Event):
@@ -474,7 +524,7 @@ class PumpFunListener:
                 seen.add(mint)
                 pairs = self.dex.get_pairs_for_mint(mint)
                 for pair in pairs:
-                    t = self.dex.parse_pair(pair, 0)
+                    t = self.dex.parse_pair(pair, None, expected_mint=mint)
                     if not t:
                         continue
                     is_rug, _ = self.rug.check(t)
@@ -500,6 +550,12 @@ class PumpFunListener:
         result = [None]
 
         async def runner():
+            # Each find_best call owns fresh asyncio primitives; reusing a
+            # semaphore across asyncio.run() event loops can bind it to an
+            # already-closed loop on later bot cycles.
+            self._pending_mints = set()
+            self._eval_semaphore = asyncio.Semaphore(self.cfg.max_parallel_evaluations)
+            self._eval_tasks = set()
             listener_task = asyncio.create_task(
                 self._listen_with_fallback(result_queue, stop_event)
             )
@@ -562,7 +618,7 @@ def _log_token(t: TokenCandidate):
     log.info(f"   Chg 5m:      {t.price_change_5m:+.1f}%")
     log.info(f"   Buys/Sells:  {t.txns_5m_buys}/{t.txns_5m_sells} ({t.buy_sell_ratio:.1f}x)")
     log.info(f"   Mcap:        ${t.market_cap:,.0f}")
-    log.info(f"   Initial buy: {t.initial_buy_sol:.2f} SOL")
+    log.info(f"   Initial buy: {t.initial_buy_sol:.2f} SOL" if t.initial_buy_sol is not None else "   Initial buy: unknown")
     log.info(f"   Score:       {t.score}/100")
     log.info(f"   URL:         {t.url}")
 

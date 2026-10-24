@@ -36,6 +36,18 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def parse_bool_env(value: str, name: str = "DRY_RUN") -> bool:
+    """Parse an explicit boolean environment value; reject ambiguous input."""
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"Invalid {name} value {value!r}; use true/false, 1/0, yes/no, or on/off"
+    )
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ════════════════════════════════════════════════════════════════════════════════
@@ -73,7 +85,7 @@ class Config:
     # ── Jupiter v6 API (api.jup.ag — NOT quote-api.jup.ag) ───────────────────
     JUPITER_QUOTE_URL:     str   = "https://api.jup.ag/swap/v1/quote"
     JUPITER_SWAP_URL:      str   = "https://api.jup.ag/swap/v1/swap"
-    DRY_RUN:               bool  = os.getenv("DRY_RUN", "true").lower() == "true"
+    DRY_RUN:               bool  = parse_bool_env(os.getenv("DRY_RUN", "true"))
 
     # ── Liquidity / dead-pool handling ────────────────────────────────────────
     # Below this, a pool is considered unsellable (no real market depth) —
@@ -161,7 +173,9 @@ class JupiterClient:
         return resp.json()["swapTransaction"]
 
     def sign_and_send(self, raw_tx_b64: str, keypair: Keypair) -> str:
-        """Deserialize, sign, and broadcast transaction."""
+        """Deserialize, sign, and broadcast transaction unless dry-run is active."""
+        if self.cfg.DRY_RUN:
+            raise RuntimeError("Safety block: sign_and_send is disabled while DRY_RUN is enabled")
         tx_bytes = base64.b64decode(raw_tx_b64)
         tx = VersionedTransaction.from_bytes(tx_bytes)
         signed_tx = VersionedTransaction(tx.message, [keypair])

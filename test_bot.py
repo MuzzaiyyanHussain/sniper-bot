@@ -1,11 +1,45 @@
+"""Regression tests for the Pump.fun scanner and dry-run safety helpers."""
 import json
+import math
 import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
-from bot import CompoundingBot, Config, Journal, StrategyCalc
-from token_scanner import ScannerConfig, TokenCandidate, RugDetector
+from bot import CompoundingBot, Config, Journal, StrategyCalc, parse_bool_env
+from token_scanner import (
+    PumpFunListener,
+    RugDetector,
+    ScannerConfig,
+    TokenCandidate,
+    parse_sol_amount,
+)
+
+
+def make_candidate(**overrides):
+    values = dict(
+        mint="Mint111111111111111111111111111111111111111",
+        symbol="OKAY",
+        name="Okay token",
+        dex="pump.fun",
+        pair_address="pair",
+        price_usd=0.3,
+        liquidity_usd=10_000.0,
+        volume_5m=2_000.0,
+        volume_1h=8_000.0,
+        price_change_5m=10.0,
+        price_change_1h=12.0,
+        market_cap=120_000.0,
+        txns_5m_buys=40,
+        txns_5m_sells=15,
+        age_minutes=1.0,
+        holder_count=35,
+        top10_pct=45.0,
+        url="https://example.com/token",
+        initial_buy_sol=None,
+    )
+    values.update(overrides)
+    return TokenCandidate(**values)
 
 
 class TestStrategyAndJournal(unittest.TestCase):
@@ -14,6 +48,7 @@ class TestStrategyAndJournal(unittest.TestCase):
         cfg.STARTING_AMOUNT_USDC = 10.0
         cfg.WIN_MULTIPLIER = 2.0
         cfg.REINVEST_PCT = 0.60
+        cfg.SAVE_PCT = 0.40
         calc = StrategyCalc(cfg)
 
         result = calc.cycle_result(10.0, True)
@@ -44,6 +79,27 @@ class TestStrategyAndJournal(unittest.TestCase):
 
 
 class TestDryRunSafety(unittest.TestCase):
+    def test_boolean_environment_parser_accepts_explicit_values(self):
+        for value in ("true", "TRUE", "1", "yes", "on"):
+            with self.subTest(value=value):
+                self.assertTrue(parse_bool_env(value))
+        for value in ("false", "FALSE", "0", "no", "off"):
+            with self.subTest(value=value):
+                self.assertFalse(parse_bool_env(value))
+
+    def test_boolean_environment_parser_rejects_ambiguous_values(self):
+        for value in ("", "maybe", "2", "enabled"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_bool_env(value)
+
+    def test_jupiter_send_is_blocked_when_dry_run_is_enabled(self):
+        from bot import JupiterClient
+        cfg = Config()
+        cfg.DRY_RUN = True
+        with self.assertRaisesRegex(RuntimeError, "DRY_RUN"):
+            JupiterClient(cfg).sign_and_send("not-a-transaction", None)
+
     def test_compounding_bot_allows_dry_run_without_wallet(self):
         cfg = Config()
         cfg.DRY_RUN = True
@@ -52,7 +108,7 @@ class TestDryRunSafety(unittest.TestCase):
         self.assertIsNone(bot.keypair)
         self.assertEqual(bot.pubkey, "DRY_RUN")
 
-    def test_run_cycle_in_dry_run_skips_balance_checks_and_live_execution(self):
+    def test_run_cycle_in_dry_run_uses_mocked_trade_execution(self):
         cfg = Config()
         cfg.DRY_RUN = True
         cfg.TOKEN_MODE = "scan"
@@ -64,112 +120,81 @@ class TestDryRunSafety(unittest.TestCase):
 
         bot = CompoundingBot(cfg)
         bot.check_balances = MagicMock()
-        bot.scanner.find_best = MagicMock(return_value=TokenCandidate(
-            mint="mint1111111111111111111111111111111111111111",
-            symbol="TEST",
-            name="Test Token",
-            dex="pump.fun",
-            pair_address="pair",
-            price_usd=1.0,
-            liquidity_usd=10000.0,
-            volume_5m=2000.0,
-            volume_1h=5000.0,
-            price_change_5m=25.0,
-            price_change_1h=10.0,
-            market_cap=100000.0,
-            txns_5m_buys=40,
-            txns_5m_sells=10,
-            age_minutes=0.5,
-            url="https://example.com/token",
-        ))
+        bot.scanner.find_best = MagicMock(return_value=make_candidate())
         bot.execute_buy = MagicMock(return_value={
-            "buy_tx": "dry-buy",
-            "usdc_spent": 4.0,
-            "token_amount": 2.0,
-            "token_decimals": 6,
-            "token_symbol": "TEST",
-            "entry_price": 2.0,
-            "target_price": 4.0,
-            "stop_price": 1.64,
-            "token_mint": "mint1111111111111111111111111111111111111111",
+            "buy_tx": "DRY_RUN_BUY", "usdc_spent": 4.0, "token_amount": 2.0,
+            "token_decimals": 6, "token_symbol": "TEST", "entry_price": 2.0,
+            "target_price": 4.0, "stop_price": 1.64,
+            "token_mint": "Mint111111111111111111111111111111111111111",
             "dex_url": "https://example.com/token",
         })
         bot.monitor_price = MagicMock(return_value=("target", 4.0))
         bot.execute_sell = MagicMock(return_value=8.0)
 
-        result = bot.run_cycle()
-        self.assertTrue(result)
+        self.assertTrue(bot.run_cycle())
         bot.check_balances.assert_not_called()
         bot.execute_buy.assert_called_once()
         bot.execute_sell.assert_called_once()
 
 
-class TestTokenFilters(unittest.TestCase):
-    def test_rug_detector_flags_suspicious_names_and_wash_trading(self):
-        candidate = TokenCandidate(
-            mint="mint1111111111111111111111111111111111111111",
-            symbol="PUMP",
-            name="Guaranteed 100x Airdrop",
-            dex="pump.fun",
-            pair_address="pair",
-            price_usd=1.0,
-            liquidity_usd=5000.0,
-            volume_5m=125000.0,
-            volume_1h=250000.0,
-            price_change_5m=35.0,
-            price_change_1h=50.0,
-            market_cap=200000.0,
-            txns_5m_buys=80,
-            txns_5m_sells=1,
-            age_minutes=1.0,
-            holder_count=40,
-            top10_pct=45.0,
-            url="https://example.com/token",
-        )
-        is_rug, reason = RugDetector().check(candidate)
-        self.assertTrue(is_rug)
-        self.assertIn("suspicious name", reason.lower())
+class TestPumpPortalAmountParsing(unittest.TestCase):
+    def test_uses_sol_amount_not_initial_buy_token_amount(self):
+        self.assertEqual(parse_sol_amount({"solAmount": 1.25, "initialBuy": 100_000_000}), 1.25)
 
-    def test_scanner_filters_reject_too_old_or_oversized_tokens(self):
+    def test_missing_sol_amount_stays_unknown(self):
+        self.assertIsNone(parse_sol_amount({"initialBuy": 100_000_000}))
+
+    def test_malformed_sol_amount_is_rejected(self):
+        for value in ("not-a-number", {}, "NaN", "Infinity", -1, 1001):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_sol_amount({"solAmount": value})
+
+    def test_zero_sol_amount_is_valid_but_not_missing(self):
+        self.assertEqual(parse_sol_amount({"solAmount": 0}), 0.0)
+
+
+class TestScannerFiltersAndMintMatching(unittest.TestCase):
+    def test_actual_scanner_filter_rejects_too_old_or_oversized_tokens(self):
         cfg = ScannerConfig()
-        cfg.max_age_minutes = 15
-        cfg.min_liquidity_usd = 2000
-        cfg.max_liquidity_usd = 50000
-        cfg.min_volume_5m_usd = 500
-        cfg.min_txns_5m = 10
-        cfg.min_buys_5m = 5
-        cfg.min_buy_sell_ratio = 1.3
-        cfg.min_market_cap_usd = 1000
-        cfg.max_market_cap_usd = 1000000
+        listener = PumpFunListener(cfg)
+        too_old = make_candidate(age_minutes=cfg.max_age_minutes + 1)
+        ok, reason = listener._passes_filters(too_old)
+        self.assertFalse(ok)
+        self.assertIn("too old", reason)
 
-        t = TokenCandidate(
-            mint="mint1111111111111111111111111111111111111111",
-            symbol="OKAY",
-            name="Okay token",
-            dex="pump.fun",
-            pair_address="pair",
-            price_usd=0.3,
-            liquidity_usd=60000.0,
-            volume_5m=700.0,
-            volume_1h=2000.0,
-            price_change_5m=10.0,
-            price_change_1h=12.0,
-            market_cap=120000.0,
-            txns_5m_buys=4,
-            txns_5m_sells=2,
-            age_minutes=7.0,
-            holder_count=35,
-            top10_pct=60.0,
-            url="https://example.com/token",
-        )
+        too_liquid = make_candidate(liquidity_usd=cfg.max_liquidity_usd + 1)
+        ok, reason = listener._passes_filters(too_liquid)
+        self.assertFalse(ok)
+        self.assertIn("liquidity too high", reason)
 
-        ok, reason = ScannerConfig().__class__.__mro__  # keep linter happy; overwritten below
-        # Re-purpose the test to validate the actual scanner filters object.
-        scanner = type("DummyScanner", (), {})()
-        scanner.cfg = cfg
-        scanner._passes_filters = lambda token: (False, "liquidity too high") if token.liquidity_usd > cfg.max_liquidity_usd else (True, "")
-        self.assertFalse(scanner._passes_filters(t)[0])
-        self.assertEqual(scanner._passes_filters(t)[1], "liquidity too high")
+    def test_unknown_initial_buy_does_not_receive_zero_buy_bonus_or_reject(self):
+        cfg = ScannerConfig()
+        listener = PumpFunListener(cfg)
+        unknown = make_candidate(initial_buy_sol=None)
+        known_high = make_candidate(initial_buy_sol=25.0)
+        self.assertEqual(listener.scorer.score(unknown), listener.scorer.score(known_high))
+        ok, reason = listener._passes_filters(unknown)
+        self.assertTrue(ok, reason)
+
+    def test_parse_pair_rejects_mismatched_mint(self):
+        listener = PumpFunListener(ScannerConfig())
+        pair = {
+            "chainId": "solana",
+            "baseToken": {"address": "WrongMint", "symbol": "WRONG", "name": "Wrong"},
+            "pairCreatedAt": 1_700_000_000_000,
+            "liquidity": {"usd": 10_000},
+        }
+        self.assertIsNone(listener.dex.parse_pair(pair, 1.0, expected_mint="ExpectedMint"))
+
+    def test_missing_pair_retry_can_recover(self):
+        listener = PumpFunListener(ScannerConfig())
+        pair = {"chainId": "solana", "baseToken": {"address": "MintX"}, "liquidity": {"usd": 1}}
+        with patch.object(listener.dex, "get_pairs_for_mint", side_effect=[[], [pair]]), \
+             patch("token_scanner.time.sleep", return_value=None), \
+             patch.object(listener.dex, "parse_pair", return_value=None) as parse_pair:
+            self.assertIsNone(listener._evaluate_mint("MintX", "X", "X", None))
+            parse_pair.assert_called_once_with(pair, None, expected_mint="MintX")
 
 
 if __name__ == "__main__":

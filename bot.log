@@ -58,3 +58,49 @@
 2026-10-23 22:42:29,010 [INFO]      Saved:      $3.2000 USDC  (total: $12.8000)
 2026-10-23 22:42:29,011 [INFO]      Next play:  $4.8000 USDC
 2026-10-23 22:42:29,011 [INFO]      Consec losses: 0
+2026-10-24 16:03:32,643 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-24 16:03:32,645 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-24 16:03:32,646 [INFO] 
+============================================================
+2026-10-24 16:03:32,646 [INFO]   CYCLE 5 | Playing $4.8000 USDC | Consec losses: 0
+2026-10-24 16:03:32,647 [INFO] ============================================================
+2026-10-24 16:03:32,647 [INFO] 🔍 Dry-run mode: scanning without checking wallet balances.
+2026-10-24 16:03:32,647 [INFO] 🔍 Scanning for best new token launch...
+2026-10-24 16:03:32,650 [INFO] 
+  ✅ Cycle 5 (TARGET) — TEST
+2026-10-24 16:03:32,651 [INFO]      Played:     $4.8000 USDC
+2026-10-24 16:03:32,651 [INFO]      Received:   $8.0000 USDC  (+66.7%)
+2026-10-24 16:03:32,651 [INFO]      Saved:      $3.2000 USDC  (total: $16.0000)
+2026-10-24 16:03:32,652 [INFO]      Next play:  $4.8000 USDC
+2026-10-24 16:03:32,652 [INFO]      Consec losses: 0
+2026-10-24 16:04:09,814 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-24 16:04:09,816 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-24 16:04:09,818 [INFO] 
+============================================================
+2026-10-24 16:04:09,818 [INFO]   CYCLE 6 | Playing $4.8000 USDC | Consec losses: 0
+2026-10-24 16:04:09,819 [INFO] ============================================================
+2026-10-24 16:04:09,819 [INFO] 🔍 Dry-run mode: scanning without checking wallet balances.
+2026-10-24 16:04:09,819 [INFO] 🔍 Scanning for best new token launch...
+2026-10-24 16:04:09,822 [INFO] 
+  ✅ Cycle 6 (TARGET) — TEST
+2026-10-24 16:04:09,822 [INFO]      Played:     $4.8000 USDC
+2026-10-24 16:04:09,822 [INFO]      Received:   $8.0000 USDC  (+66.7%)
+2026-10-24 16:04:09,823 [INFO]      Saved:      $3.2000 USDC  (total: $19.2000)
+2026-10-24 16:04:09,823 [INFO]      Next play:  $4.8000 USDC
+2026-10-24 16:04:09,823 [INFO]      Consec losses: 0
+2026-10-24 16:11:05,393 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-24 16:11:05,395 [INFO] Wallet disabled for dry-run mode; no live key material required.
+2026-10-24 16:11:05,396 [INFO] 
+============================================================
+2026-10-24 16:11:05,396 [INFO]   CYCLE 7 | Playing $4.8000 USDC | Consec losses: 0
+2026-10-24 16:11:05,396 [INFO] ============================================================
+2026-10-24 16:11:05,397 [INFO] 🔍 Dry-run mode: scanning without checking wallet balances.
+2026-10-24 16:11:05,397 [INFO] 🔍 Scanning for best new token launch...
+2026-10-24 16:11:05,399 [INFO] 
+  ✅ Cycle 7 (TARGET) — TEST
+2026-10-24 16:11:05,400 [INFO]      Played:     $4.8000 USDC
+2026-10-24 16:11:05,400 [INFO]      Received:   $8.0000 USDC  (+66.7%)
+2026-10-24 16:11:05,400 [INFO]      Saved:      $3.2000 USDC  (total: $22.4000)
+2026-10-24 16:11:05,400 [INFO]      Next play:  $4.8000 USDC
+2026-10-24 16:11:05,401 [INFO]      Consec losses: 0
+2026-10-24 16:11:05,403 [INFO]    🔎 Checking pair data — X (MintX...)
