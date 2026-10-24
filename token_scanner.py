@@ -259,28 +259,49 @@ class DexScreenerClient:
             return []
 
 
-    def parse_pair(self, pair: dict, initial_buy_sol: float | None = None, expected_mint: str | None = None) -> "TokenCandidate | None":
+    def parse_pair(
+        self,
+        pair: dict,
+        initial_buy_sol: float | None = None,
+        expected_mint: str | None = None,
+    ) -> "TokenCandidate | None":
+        """Parse DexScreener data, rejecting malformed/non-finite numeric values."""
         try:
-            if pair.get("chainId") != "solana":
+            if not isinstance(pair, dict) or pair.get("chainId") != "solana":
                 return None
-            base = pair.get("baseToken", {})
+
+            base = pair.get("baseToken")
+            if not isinstance(base, dict):
+                return None
+
             mint = base.get("address", "")
-            if not mint:
+            if not isinstance(mint, str) or not mint:
                 return None
             if expected_mint and mint.lower() != expected_mint.lower():
                 return None
 
+            def number(value, field, default=0.0):
+                if value is None or value == "":
+                    return default
+                try:
+                    result = float(value)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise ValueError(f"Invalid {field}") from exc
+                if not math.isfinite(result):
+                    raise ValueError(f"Non-finite {field}")
+                return result
+
+            def nonnegative(value, field, default=0.0):
+                result = number(value, field, default)
+                if result < 0:
+                    raise ValueError(f"Negative {field}")
+                return result
+
             created_at = pair.get("pairCreatedAt")
             now_ms = time.time() * 1000
             if created_at is not None:
-                try:
-                    created_at = float(created_at)
-                except (TypeError, ValueError):
-                    log.warning("Invalid pairCreatedAt for mint %s", mint[:8])
-                    return None
-                # Reject clearly future-dated pair timestamps instead of treating
-                # them as a fresh token. A small clock/API tolerance is allowed.
-                if not math.isfinite(created_at) or created_at > now_ms + 5 * 60 * 1000:
+                created_at = number(created_at, "pairCreatedAt")
+                if created_at > now_ms + 5 * 60 * 1000:
                     log.warning(
                         "Future/invalid pairCreatedAt for %s; skipping pair",
                         mint[:8],
@@ -298,51 +319,80 @@ class DexScreenerClient:
             )
             if liquidity_raw is None:
                 log.warning(
-        "SKIP-CANDIDATE: liquidity unavailable from DexScreener "
-        "| mint=%s | dex=%s | pair=%s | price_usd=%s "
-        "| eligibility=FAIL-CLOSED",
-                   mint,
-                   pair.get("dexId", "unknown"),
-                   pair.get("pairAddress", "unknown"),
-                   pair.get("priceUsd", "unknown"),
-         )
+                    "SKIP-CANDIDATE: liquidity unavailable from DexScreener "
+                    "| mint=%s | dex=%s | pair=%s | price_usd=%s "
+                    "| eligibility=FAIL-CLOSED",
+                    mint,
+                    pair.get("dexId", "unknown"),
+                    pair.get("pairAddress", "unknown"),
+                    pair.get("priceUsd", "unknown"),
+                )
                 liquidity = 0.0
             else:
-                try:
-                    liquidity = float(liquidity_raw)
-                except (TypeError, ValueError):
-                    log.warning("Invalid liquidity value for %s; skipping pair", mint[:8])
-                    return None
-                if not math.isfinite(liquidity) or liquidity < 0:
-                    log.warning("Invalid liquidity value for %s; skipping pair", mint[:8])
-                    return None
-            volume     = pair.get("volume", {})
-            price_chg  = pair.get("priceChange", {})
-            txns       = pair.get("txns", {})
-            txns_5m    = txns.get("m5", {})
-            market_cap = pair.get("marketCap") or pair.get("fdv") or 0
+                liquidity = nonnegative(liquidity_raw, "liquidity")
+
+            volume = pair.get("volume") or {}
+            price_change = pair.get("priceChange") or {}
+            txns = pair.get("txns") or {}
+            if not all(
+                isinstance(item, dict)
+                for item in (volume, price_change, txns)
+            ):
+                return None
+
+            txns_5m = txns.get("m5") or {}
+            if not isinstance(txns_5m, dict):
+                return None
+
+            price_usd = nonnegative(pair.get("priceUsd"), "priceUsd")
+            volume_5m = nonnegative(volume.get("m5"), "volume.m5")
+            volume_1h = nonnegative(volume.get("h1"), "volume.h1")
+            price_change_5m = number(
+                price_change.get("m5"), "priceChange.m5"
+            )
+            price_change_1h = number(
+                price_change.get("h1"), "priceChange.h1"
+            )
+
+            market_cap_raw = pair.get("marketCap")
+            if market_cap_raw is None or market_cap_raw == "":
+                market_cap_raw = pair.get("fdv")
+            market_cap = nonnegative(market_cap_raw, "marketCap/fdv")
+
+            buys = number(txns_5m.get("buys"), "txns.m5.buys")
+            sells = number(txns_5m.get("sells"), "txns.m5.sells")
+            if (
+                buys < 0
+                or sells < 0
+                or not buys.is_integer()
+                or not sells.is_integer()
+            ):
+                return None
 
             return TokenCandidate(
-                mint             = mint,
-                symbol           = base.get("symbol", "???"),
-                name             = base.get("name", "Unknown"),
-                dex              = pair.get("dexId", "").lower(),
-                pair_address     = pair.get("pairAddress", ""),
-                price_usd        = float(pair.get("priceUsd") or 0),
-                liquidity_usd    = float(liquidity),
-                volume_5m        = float(volume.get("m5") or 0),
-                volume_1h        = float(volume.get("h1") or 0),
-                price_change_5m  = float(price_chg.get("m5") or 0),
-                price_change_1h  = float(price_chg.get("h1") or 0),
-                market_cap       = float(market_cap),
-                txns_5m_buys     = int(txns_5m.get("buys") or 0),
-                txns_5m_sells    = int(txns_5m.get("sells") or 0),
-                age_minutes      = age_min,
-                initial_buy_sol  = initial_buy_sol,
-                url              = pair.get("url", f"https://dexscreener.com/solana/{mint}"),
+                mint=mint,
+                symbol=base.get("symbol", "???"),
+                name=base.get("name", "Unknown"),
+                dex=str(pair.get("dexId") or "").lower(),
+                pair_address=str(pair.get("pairAddress") or ""),
+                price_usd=price_usd,
+                liquidity_usd=liquidity,
+                volume_5m=volume_5m,
+                volume_1h=volume_1h,
+                price_change_5m=price_change_5m,
+                price_change_1h=price_change_1h,
+                market_cap=market_cap,
+                txns_5m_buys=int(buys),
+                txns_5m_sells=int(sells),
+                age_minutes=age_min,
+                initial_buy_sol=initial_buy_sol,
+                url=pair.get("url") or f"https://dexscreener.com/solana/{mint}",
             )
-        except Exception as e:
-            log.debug(f"Parse error: {e}")
+        except (TypeError, ValueError, OverflowError) as exc:
+            log.warning("Invalid pair data; skipping pair: %s", exc)
+            return None
+        except Exception as exc:
+            log.debug("Parse error: %s", exc)
             return None
 
 

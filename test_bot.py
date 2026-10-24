@@ -240,6 +240,35 @@ class TestScannerFiltersAndMintMatching(unittest.TestCase):
             listener.dex.parse_pair(pair, expected_mint="MintX")
         )
 
+    def test_invalid_price_is_rejected(self):
+        listener = PumpFunListener(ScannerConfig())
+        pair = {
+            "chainId": "solana",
+            "baseToken": {"address": "MintX"},
+            "pairCreatedAt": time.time() * 1000,
+            "liquidity": {"usd": 10_000},
+            "priceUsd": "NaN",
+        }
+
+        self.assertIsNone(
+            listener.dex.parse_pair(pair, expected_mint="MintX")
+        )
+
+    def test_invalid_volume_is_rejected(self):
+        listener = PumpFunListener(ScannerConfig())
+        pair = {
+            "chainId": "solana",
+            "baseToken": {"address": "MintX"},
+            "pairCreatedAt": time.time() * 1000,
+            "liquidity": {"usd": 10_000},
+            "volume": {"m5": "Infinity"},
+            "priceUsd": "0.001",
+        }
+
+        self.assertIsNone(
+            listener.dex.parse_pair(pair, expected_mint="MintX")
+        )
+
     def test_missing_pair_retry_can_recover(self):
         listener = PumpFunListener(ScannerConfig())
         pair = {
