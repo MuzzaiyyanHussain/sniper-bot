@@ -73,7 +73,7 @@ class ScannerConfig:
 
     # Allowed DEXes
     allowed_dexes: list = field(default_factory=lambda: [
-        "raydium", "orca", "meteora", "pump.fun", "fluxbeam", "pumpswap"
+        "raydium", "orca", "meteora", "pump.fun", "pumpfun", "pumpswap", "fluxbeam"
     ])
 
     # WebSocket settings
@@ -214,17 +214,50 @@ class DexScreenerClient:
         self.session = requests.Session()
         self.session.headers.update(self.HEADERS)
 
+
     def get_pairs_for_mint(self, mint: str) -> list:
+        """Fetch pairs and distinguish API failures from valid empty results."""
         try:
             resp = self.session.get(
                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                timeout=2,
+                timeout=5,
             )
             resp.raise_for_status()
-            return resp.json().get("pairs") or []
-        except Exception as e:
-            log.debug(f"DexScreener error for {mint[:8]}: {e}")
+            data = resp.json()
+
+            if not isinstance(data, dict):
+                log.warning(
+                    "DexScreener unexpected response for %s: expected object",
+                    mint[:8],
+                )
+                return []
+
+            pairs = data.get("pairs")
+            if pairs is None:
+                return []
+
+            if not isinstance(pairs, list):
+                log.warning(
+                    "DexScreener invalid pairs field for %s",
+                    mint[:8],
+                )
+                return []
+
+            return pairs
+
+        except requests.RequestException as e:
+            log.warning(
+                "DexScreener HTTP/network failure for %s: %s: %s",
+                mint[:8], type(e).__name__, e,
+            )
             return []
+        except ValueError as e:
+            log.warning(
+                "DexScreener invalid JSON for %s: %s",
+                mint[:8], e,
+            )
+            return []
+
 
     def parse_pair(self, pair: dict, initial_buy_sol: float | None = None, expected_mint: str | None = None) -> "TokenCandidate | None":
         try:
@@ -238,9 +271,51 @@ class DexScreenerClient:
                 return None
 
             created_at = pair.get("pairCreatedAt")
-            age_min = ((time.time() - created_at / 1000) / 60) if created_at else 999
+            now_ms = time.time() * 1000
+            if created_at is not None:
+                try:
+                    created_at = float(created_at)
+                except (TypeError, ValueError):
+                    log.warning("Invalid pairCreatedAt for mint %s", mint[:8])
+                    return None
+                # Reject clearly future-dated pair timestamps instead of treating
+                # them as a fresh token. A small clock/API tolerance is allowed.
+                if not math.isfinite(created_at) or created_at > now_ms + 5 * 60 * 1000:
+                    log.warning(
+                        "Future/invalid pairCreatedAt for %s; skipping pair",
+                        mint[:8],
+                    )
+                    return None
+                age_min = max(0.0, (now_ms - created_at) / 60_000)
+            else:
+                age_min = 999.0
 
-            liquidity  = pair.get("liquidity", {}).get("usd", 0) or 0
+            liquidity_data = pair.get("liquidity")
+            liquidity_raw = (
+                liquidity_data.get("usd")
+                if isinstance(liquidity_data, dict)
+                else None
+            )
+            if liquidity_raw is None:
+                log.warning(
+        "SKIP-CANDIDATE: liquidity unavailable from DexScreener "
+        "| mint=%s | dex=%s | pair=%s | price_usd=%s "
+        "| eligibility=FAIL-CLOSED",
+                   mint,
+                   pair.get("dexId", "unknown"),
+                   pair.get("pairAddress", "unknown"),
+                   pair.get("priceUsd", "unknown"),
+         )
+                liquidity = 0.0
+            else:
+                try:
+                    liquidity = float(liquidity_raw)
+                except (TypeError, ValueError):
+                    log.warning("Invalid liquidity value for %s; skipping pair", mint[:8])
+                    return None
+                if not math.isfinite(liquidity) or liquidity < 0:
+                    log.warning("Invalid liquidity value for %s; skipping pair", mint[:8])
+                    return None
             volume     = pair.get("volume", {})
             price_chg  = pair.get("priceChange", {})
             txns       = pair.get("txns", {})
@@ -317,51 +392,69 @@ class PumpFunListener:
 
     def _evaluate_mint(self, mint: str, name: str, symbol: str,
                        initial_buy_sol: float | None) -> "TokenCandidate | None":
-        """
-        Wait for DexScreener to index the pair, then evaluate.
-        Called after WebSocket notifies us of a new token.
-        """
-        log.info(f"   🔎 Checking pair data — {symbol} ({mint[:8]}...)")
-        deadline = time.monotonic() + 8
-        pairs = []
+        """Wait for DexScreener pair data, then evaluate the token."""
+        log.info("   🔎 Checking pair data — %s (%s...)", symbol, mint[:8])
+
+        # Honor the configured wait. The HTTP request itself has a bounded timeout.
+        deadline = time.monotonic() + max(1, self.cfg.pair_wait_sec)
+        matching_pairs = []
 
         while time.monotonic() < deadline:
             pairs = self.dex.get_pairs_for_mint(mint)
-            if pairs:
+            matching_pairs = [
+                pair for pair in pairs
+                if pair.get("chainId") == "solana"
+                and (pair.get("baseToken", {}).get("address") or "").lower()
+                == mint.lower()
+            ]
+            if matching_pairs:
                 break
-            time.sleep(0.5)
 
-        if not pairs:
-            log.info(f"   ⚠️ No pairs found for {symbol} after retries — skipping")
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1.0, remaining))
+
+        if not matching_pairs:
+            log.info(
+                "   ⚠️ No matching pairs found for %s after retries — skipping",
+                symbol,
+            )
             return None
 
-        pairs_sol = [
-            p for p in pairs
-            if p.get("chainId") == "solana"
-            and (p.get("baseToken", {}).get("address") or "").lower() == mint.lower()
-        ]
-        if not pairs_sol:
-            return None
-        best_pair = max(pairs_sol, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
+        # Evaluate each exact-mint pair independently. An old/high-liquidity
+        # pool must not hide another pair that may pass the existing filters.
+        eligible = []
 
-        t = self.dex.parse_pair(best_pair, initial_buy_sol, expected_mint=mint)
-        if not t:
+        for pair in matching_pairs:
+            candidate = self.dex.parse_pair(
+                pair, initial_buy_sol, expected_mint=mint
+            )
+            if candidate is None:
+                continue
+
+            is_rug, reason = self.rug.check(candidate)
+            if is_rug:
+                log.warning(
+                    "   RUG detected %s on %s: %s",
+                    symbol, candidate.dex, reason
+                )
+                continue
+
+            ok, reason = self._passes_filters(candidate)
+            if not ok:
+                log.info(
+                    "   SKIP %s on %s: %s",
+                    symbol, candidate.dex, reason
+                )
+                continue
+
+            candidate.score = self.scorer.score(candidate)
+            eligible.append(candidate)
+
+        if not eligible:
             return None
 
-        # Rug check
-        is_rug, reason = self.rug.check(t)
-        if is_rug:
-            log.warning(f"   🚨 RUG detected {symbol}: {reason}")
-            return None
-
-        # Filter check
-        ok, reason = self._passes_filters(t)
-        if not ok:
-            log.info(f"   SKIP {symbol}: {reason}")
-            return None
-
-        t.score = self.scorer.score(t)
-        return t
+        return max(eligible, key=lambda candidate: candidate.score)
 
     async def _listen_ws(self, endpoint: str, result_queue: asyncio.Queue,
                          stop_event: asyncio.Event):

@@ -3,6 +3,7 @@ import json
 import math
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -95,6 +96,7 @@ class TestDryRunSafety(unittest.TestCase):
 
     def test_jupiter_send_is_blocked_when_dry_run_is_enabled(self):
         from bot import JupiterClient
+
         cfg = Config()
         cfg.DRY_RUN = True
         with self.assertRaisesRegex(RuntimeError, "DRY_RUN"):
@@ -122,9 +124,14 @@ class TestDryRunSafety(unittest.TestCase):
         bot.check_balances = MagicMock()
         bot.scanner.find_best = MagicMock(return_value=make_candidate())
         bot.execute_buy = MagicMock(return_value={
-            "buy_tx": "DRY_RUN_BUY", "usdc_spent": 4.0, "token_amount": 2.0,
-            "token_decimals": 6, "token_symbol": "TEST", "entry_price": 2.0,
-            "target_price": 4.0, "stop_price": 1.64,
+            "buy_tx": "DRY_RUN_BUY",
+            "usdc_spent": 4.0,
+            "token_amount": 2.0,
+            "token_decimals": 6,
+            "token_symbol": "TEST",
+            "entry_price": 2.0,
+            "target_price": 4.0,
+            "stop_price": 1.64,
             "token_mint": "Mint111111111111111111111111111111111111111",
             "dex_url": "https://example.com/token",
         })
@@ -139,7 +146,10 @@ class TestDryRunSafety(unittest.TestCase):
 
 class TestPumpPortalAmountParsing(unittest.TestCase):
     def test_uses_sol_amount_not_initial_buy_token_amount(self):
-        self.assertEqual(parse_sol_amount({"solAmount": 1.25, "initialBuy": 100_000_000}), 1.25)
+        self.assertEqual(
+            parse_sol_amount({"solAmount": 1.25, "initialBuy": 100_000_000}),
+            1.25,
+        )
 
     def test_missing_sol_amount_stays_unknown(self):
         self.assertIsNone(parse_sol_amount({"initialBuy": 100_000_000}))
@@ -181,20 +191,73 @@ class TestScannerFiltersAndMintMatching(unittest.TestCase):
         listener = PumpFunListener(ScannerConfig())
         pair = {
             "chainId": "solana",
-            "baseToken": {"address": "WrongMint", "symbol": "WRONG", "name": "Wrong"},
+            "baseToken": {
+                "address": "WrongMint",
+                "symbol": "WRONG",
+                "name": "Wrong",
+            },
             "pairCreatedAt": 1_700_000_000_000,
             "liquidity": {"usd": 10_000},
         }
-        self.assertIsNone(listener.dex.parse_pair(pair, 1.0, expected_mint="ExpectedMint"))
+        self.assertIsNone(
+            listener.dex.parse_pair(pair, 1.0, expected_mint="ExpectedMint")
+        )
+
+    def test_parse_pair_missing_liquidity_stays_ineligible(self):
+        listener = PumpFunListener(ScannerConfig())
+        pair = {
+            "chainId": "solana",
+            "baseToken": {
+                "address": "MintX",
+                "symbol": "X",
+                "name": "Token X",
+            },
+            "pairCreatedAt": time.time() * 1000,
+            "liquidity": None,
+            "volume": {"m5": 2000},
+            "priceUsd": "0.001",
+            "marketCap": 10000,
+            "txns": {"m5": {"buys": 20, "sells": 5}},
+        }
+
+        candidate = listener.dex.parse_pair(pair, expected_mint="MintX")
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.liquidity_usd, 0.0)
+
+        ok, reason = listener._passes_filters(candidate)
+        self.assertFalse(ok)
+        self.assertIn("low liquidity", reason)
+
+    def test_invalid_liquidity_is_rejected(self):
+        listener = PumpFunListener(ScannerConfig())
+        pair = {
+            "chainId": "solana",
+            "baseToken": {"address": "MintX"},
+            "liquidity": {"usd": float("nan")},
+        }
+
+        self.assertIsNone(
+            listener.dex.parse_pair(pair, expected_mint="MintX")
+        )
 
     def test_missing_pair_retry_can_recover(self):
         listener = PumpFunListener(ScannerConfig())
-        pair = {"chainId": "solana", "baseToken": {"address": "MintX"}, "liquidity": {"usd": 1}}
-        with patch.object(listener.dex, "get_pairs_for_mint", side_effect=[[], [pair]]), \
-             patch("token_scanner.time.sleep", return_value=None), \
-             patch.object(listener.dex, "parse_pair", return_value=None) as parse_pair:
-            self.assertIsNone(listener._evaluate_mint("MintX", "X", "X", None))
-            parse_pair.assert_called_once_with(pair, None, expected_mint="MintX")
+        pair = {
+            "chainId": "solana",
+            "baseToken": {"address": "MintX"},
+            "liquidity": {"usd": 1},
+        }
+        with patch.object(
+            listener.dex, "get_pairs_for_mint", side_effect=[[], [pair]]
+        ), patch("token_scanner.time.sleep", return_value=None), patch.object(
+            listener.dex, "parse_pair", return_value=None
+        ) as parse_pair:
+            self.assertIsNone(
+                listener._evaluate_mint("MintX", "X", "X", None)
+            )
+            parse_pair.assert_called_once_with(
+                pair, None, expected_mint="MintX"
+            )
 
 
 if __name__ == "__main__":

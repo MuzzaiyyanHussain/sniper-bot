@@ -1,2 +1,9 @@
 *.env
 *.env.example
+
+# Generated runtime data
+__pycache__/
+*.py[cod]
+bot.log
+journal.json
+trade_log.csv
