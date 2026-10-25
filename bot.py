@@ -65,7 +65,7 @@ class Config:
     POLL_INTERVAL_SEC:     int   = int(os.getenv("POLL_INTERVAL_SEC", "8"))
     PRICE_TARGET_MULT:     float = float(os.getenv("PRICE_TARGET_MULT", "2.0"))
     STOP_LOSS_MULT:        float = float(os.getenv("STOP_LOSS_MULT", "0.82"))
-    MAX_CYCLES:            int   = int(os.getenv("MAX_CYCLES", "30"))
+    MAX_CYCLES:            int   = int(os.getenv("MAX_CYCLES", "0"))  # 0 = run until Ctrl+C
     SLIPPAGE_BPS:          int   = int(os.getenv("SLIPPAGE_BPS", "50"))
     PRIORITY_FEE_LAMPORTS: int   = int(os.getenv("PRIORITY_FEE_LAMPORTS", "1000"))
     SOLANA_RPC_URL:        str   = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
@@ -95,6 +95,9 @@ class Config:
     # Once a position is confirmed dead-pool, back off hard between rechecks
     # instead of retrying every 60s forever.
     DEAD_POOL_RECHECK_SEC:      int   = int(os.getenv("DEAD_POOL_RECHECK_SEC", "600"))
+    # If no usable price is seen for this long while holding a position, give
+    # up waiting and attempt an exit instead of polling forever. 0 disables.
+    MAX_NO_PRICE_SEC:           int   = int(os.getenv("MAX_NO_PRICE_SEC", "120"))
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -136,6 +139,28 @@ def usdc_to_lamports(usdc: float) -> int:
 
 def lamports_to_usdc(lam: int) -> float:
     return lam / (10 ** USDC_DECIMALS)
+
+
+# Stop-breach classification (used by CompoundingBot.monitor_price).
+SUSTAINED_DROP_PCT = 15.0   # breach tick must be at least this far under the recent average
+PRIOR_DECLINE_PCT = 5.0     # previous tick must already be this far under the readings before it
+
+
+def is_sustained_crash(recent_prices: list, price: float) -> bool:
+    """True only when the price was already falling before this tick AND this
+    tick is >= SUSTAINED_DROP_PCT below the recent average. A single anomalous
+    tick from a flat baseline is not sustained, however large the jump is.
+    Comparisons are cross-multiplied so exact boundary values are not lost to
+    float division error."""
+    if len(recent_prices) < 2:
+        return False
+    prior = recent_prices[-1]
+    baseline = sum(recent_prices[:-1]) / (len(recent_prices) - 1)
+    average = sum(recent_prices) / len(recent_prices)
+    if baseline <= 0 or average <= 0:
+        return False
+    already_falling = prior * 100.0 <= baseline * (100.0 - PRIOR_DECLINE_PCT)
+    return already_falling and price * 100.0 <= average * (100.0 - SUSTAINED_DROP_PCT)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -238,27 +263,32 @@ class PriceOracle:
         self._decimals_cache: dict = {}
 
     def get_token_decimals(self, token_mint: str) -> int:
-        """Fetch actual on-chain decimals for a mint. Cached per run."""
+        """Fetch verified on-chain mint decimals; never guess on RPC failure."""
         if token_mint in self._decimals_cache:
             return self._decimals_cache[token_mint]
         try:
             payload = {
                 "jsonrpc": "2.0", "id": 1,
                 "method": "getAccountInfo",
-                "params": [token_mint, {"encoding": "jsonParsed"}],
+                "params": [token_mint, {"encoding": "jsonParsed", "commitment": "confirmed"}],
             }
             resp = requests.post(self.cfg.SOLANA_RPC_URL, json=payload, timeout=8)
             resp.raise_for_status()
-            info = resp.json().get("result", {}).get("value", {})
-            decimals = info.get("data", {}).get("parsed", {}).get("info", {}).get("decimals")
-            if decimals is not None:
-                self._decimals_cache[token_mint] = int(decimals)
-                return int(decimals)
-        except Exception as e:
-            log.debug(f"Could not fetch decimals for {token_mint[:8]}: {e}")
-        # Safe fallback — most pump.fun tokens use 6 decimals
-        self._decimals_cache[token_mint] = 6
-        return 6
+            body = resp.json()
+            if not isinstance(body, dict) or body.get("error"):
+                raise RuntimeError("RPC returned an error while reading mint decimals")
+            value = body.get("result", {}).get("value")
+            if not isinstance(value, dict):
+                raise RuntimeError("Mint account was not found by the RPC")
+            info = value.get("data", {}).get("parsed", {}).get("info", {})
+            decimals = info.get("decimals")
+            if isinstance(decimals, bool) or not isinstance(decimals, int) or not 0 <= decimals <= 18:
+                raise RuntimeError("RPC response did not contain valid mint decimals")
+            self._decimals_cache[token_mint] = decimals
+            return decimals
+        except Exception as exc:
+            log.warning("Cannot verify decimals for %s; aborting safely: %s", token_mint[:8], exc)
+            raise RuntimeError(f"Cannot verify token decimals for {token_mint[:8]}; refusing to calculate token amount") from exc
 
     def get_price_and_liquidity(self, token_mint: str) -> tuple[float, float | None]:
         """Return a validated (price_usd, liquidity_usd) pair.
@@ -421,7 +451,7 @@ class CompoundingBot:
         self.jup    = JupiterClient(cfg)
         self.oracle = PriceOracle(cfg)
         self.j      = Journal()
-        self.scanner = TokenScanner(ScannerConfig())
+        self.scanner = TokenScanner(ScannerConfig(), birdeye_api_key=os.getenv("BIRDEYE_API_KEY", ""))
 
         if self.cfg.DRY_RUN:
             self.keypair = None
@@ -462,7 +492,7 @@ class CompoundingBot:
                     time.sleep(delay)
                 else:
                     log.warning(f"USDC balance fetch failed after {retries} attempts: {e}")
-        return 0.0
+        raise RuntimeError("Unable to verify USDC balance after RPC retries")
 
     def get_sol_balance(self, retries: int = 4, delay: int = 5) -> float:
         if self.cfg.DRY_RUN:
@@ -479,26 +509,25 @@ class CompoundingBot:
                     time.sleep(delay)
                 else:
                     log.warning(f"SOL balance fetch failed after {retries} attempts: {e}")
-        return 0.0
+        raise RuntimeError("Unable to verify SOL balance after RPC retries")
 
     def check_balances(self, required_usdc: float) -> bool:
-        usdc = self.get_usdc_balance()
-        sol  = self.get_sol_balance()
+        try:
+            usdc = self.get_usdc_balance()
+            sol = self.get_sol_balance()
+        except Exception as e:
+            log.error(f"Cannot verify wallet balances; refusing to trade: {e}")
+            return False
         log.info(f"💳 Wallet — USDC: ${usdc:.4f}  |  SOL: {sol:.4f}")
 
-        # If both came back as 0.0 it almost certainly means the RPC
-        # timed out on both calls (not that the wallet is genuinely empty),
-        # since a wallet with $0 USDC and $0 SOL would not be running a
-        # live bot. Treat this as a transient RPC failure and keep going
-        # rather than halting the bot — the buy itself will fail cleanly
-        # if funds truly aren't there.
+        # Zero USDC and zero SOL is not sufficient funding to trade.
+        # Fail closed; do not infer an RPC failure from a zero balance.
         if usdc == 0.0 and sol == 0.0:
-            log.warning(
-                "⚠️  Both USDC and SOL returned 0.0 — likely an RPC timeout "
-                "rather than an empty wallet. Proceeding cautiously; the buy "
-                "transaction itself will verify funds on-chain."
-            )
-            return True
+            log.error(
+         "Balance check failed or wallet has no funds. "
+         "Refusing to trade until balances are verified."
+      )
+            return False
 
         if usdc < required_usdc:
             log.error(f"❌ Insufficient USDC: have ${usdc:.4f}, need ${required_usdc:.4f}. Top up and restart.")
@@ -599,7 +628,7 @@ class CompoundingBot:
                 self.j.data["open_position"] = position
                 self.j.save()
                 return None
-        elif reason == "stop_loss":
+        elif reason in ("stop_loss", "no_price"):
             slippage_schedule = [
                 self.cfg.SLIPPAGE_BPS,
                 500,
@@ -682,21 +711,14 @@ class CompoundingBot:
         symbol = position.get("token_symbol", mint[:8])
         log.info(f"👁  Monitoring {symbol} | Target=${target:.8f} | Stop={'off' if stop==0 else f'${stop:.8f}'}")
 
-        # ── Stop-loss confirmation guard ──────────────────────────────────────
-        # A stop-loss only fires after CONFIRM_TICKS consecutive readings are
-        # at or below the stop price. This protects against two distinct
-        # failure modes seen in real logs:
-        #   1. A single bad/stale price read right after buying (e.g. a stop
-        #      firing 1.2s after entry with zero real price history — almost
-        #      certainly an oracle glitch, not a real market move).
-        #   2. A genuine but extremely brief wick that recovers immediately
-        #      (low-liquidity tokens can spike a single bad print for one
-        #      tick due to thin order books, then bounce back).
-        # Genuine gap-through dumps (price actually crashing and staying
-        # down) still get caught — they simply confirm on the very next tick
-        # since the price stays low, costing at most one extra poll interval.
-        CONFIRM_TICKS = 2
-
+        # ── Stop-loss confirmation ────────────────────────────────────────────
+        # A breach exits immediately only if is_sustained_crash() says the price
+        # was already falling and this tick is >= SUSTAINED_DROP_PCT under the
+        # recent average. Any other breach (including a lone anomalous tick from
+        # a flat baseline) must be confirmed by exactly one further breached
+        # reading after warmup; a recovery above the stop cancels it.
+        RECENT_PRICE_BUFFER = 5  # last readings used as the baseline
+        
         # ── Buy warmup ─────────────────────────────────────────────────────────
         # Ignore stop-loss entirely for the first few seconds after a buy.
         # This is specifically to stop the "instant stop-loss" pattern seen
@@ -706,7 +728,8 @@ class CompoundingBot:
         BUY_WARMUP_SEC = 6
 
         start_time = time.time()
-        stop_confirm_count = 0
+        stop_wick_seen = False  # Track if we saw one wick; exit if still breached next tick
+        recent_prices = [position["entry_price"]]  # Rolling buffer of good prices
         last_good_price = position["entry_price"]
 
         # ── Relative jump sanity check ──────────────────────────────────────
@@ -725,15 +748,27 @@ class CompoundingBot:
         # This prevents the infinite-loop-on-rug scenario entirely.
         MAX_DISCARDS = 5
         discard_count = 0
+        no_price_since = None  # start of the current run of missing prices
 
         while True:
             price, liquidity_usd = self.oracle.get_price_and_liquidity(mint)
-            elapsed = time.time() - start_time
+            now = time.time()
+            elapsed = now - start_time
 
             if price <= 0:
+                if no_price_since is None:
+                    no_price_since = now
+                missing_for = now - no_price_since
+                if self.cfg.MAX_NO_PRICE_SEC > 0 and missing_for >= self.cfg.MAX_NO_PRICE_SEC:
+                    log.error(
+                        f"   🚨 No usable price for {symbol} for {missing_for:.0f}s "
+                        f"(limit {self.cfg.MAX_NO_PRICE_SEC}s) — attempting exit instead of waiting."
+                    )
+                    return "no_price", last_good_price
                 log.warning("   Price fetch returned 0 — retrying...")
                 time.sleep(self.cfg.POLL_INTERVAL_SEC)
                 continue
+            no_price_since = None
 
             # ── Dead-pool guard ──────────────────────────────────────────────
             # A pool with (near) zero liquidity can never be sold into,
@@ -788,26 +823,35 @@ class CompoundingBot:
                         f"stale read, not acting yet."
                     )
                 else:
-                    stop_confirm_count += 1
-                    if stop_confirm_count >= CONFIRM_TICKS:
+                    if is_sustained_crash(recent_prices, price):
                         log.info(
-                            f"   🛑 Stop-loss confirmed ({stop_confirm_count}/"
-                            f"{CONFIRM_TICKS} consecutive readings at/below stop)"
+                            f"   🛑 Stop-loss (sustained crash): ${price:.8f} is "
+                            f">={SUSTAINED_DROP_PCT}% under the recent average and the "
+                            f"price was already falling — exiting without waiting"
                         )
                         return "stop_loss", price
-                    else:
+                    elif not stop_wick_seen:
+                        stop_wick_seen = True
                         log.warning(
-                            f"   ⚠️  Price at/below stop ({stop_confirm_count}/"
-                            f"{CONFIRM_TICKS} confirmations) — confirming on next tick"
+                            f"   ⚠️  Price at/below stop but not a confirmed crash — "
+                            f"confirming on next tick"
                         )
+                    else:
+                        log.info(
+                            f"   🛑 Stop-loss confirmed: still at/below stop "
+                            f"(${price:.8f}) on the next tick"
+                        )
+                        return "stop_loss", price
             else:
-                # Price recovered above stop — reset confirmation counter.
-                # This is what protects against single-tick wicks that
-                # bounce back (like QUIVER #1's -17.1% dip that recovered
-                # to +1.2% before the real crash).
-                if stop_confirm_count > 0:
-                    log.info(f"   ✅ Price recovered above stop — resetting confirmation counter")
-                stop_confirm_count = 0
+                # Price recovered above stop — reset confirmation counter
+                if stop_wick_seen:
+                    log.info(f"   ✅ Price recovered above stop — resetting")
+                stop_wick_seen = False
+
+            # Update recent price buffer (keep last RECENT_PRICE_BUFFER good prices)
+            recent_prices.append(price)
+            if len(recent_prices) > RECENT_PRICE_BUFFER:
+                recent_prices.pop(0)
 
             last_good_price = price
             time.sleep(self.cfg.POLL_INTERVAL_SEC)
@@ -922,20 +966,21 @@ class CompoundingBot:
         if self.cfg.DRY_RUN:
             log.warning("⚠️  DRY RUN MODE — no real transactions will be sent")
 
-        self._print_projection()
-
-        # Startup balance display
-        usdc = self.get_usdc_balance()
-        sol  = self.get_sol_balance()
+        # Do not display hypothetical compounding as expected/actual profit.
+        # MAX_CYCLES=0 (default) means run until Ctrl+C. A positive value limits
+        # successful cycles in THIS process, not the cumulative journal counter.
         if self.cfg.DRY_RUN:
-            log.info(f"💳 Wallet — USDC: ${usdc:.4f}  |  SOL: {sol:.4f} (dry run — not enforced)")
-        else:
-            if not self.check_balances(self.j.data["play_amount_usdc"]):
-                log.error("Fix wallet balance before running live.")
-                sys.exit(1)
+            log.info("💳 [DRY RUN] No wallet balance is checked; no real transactions will be sent.")
+            log.info("📈 Paper mode uses live quotes/prices where available; results are not guaranteed.")
+        elif not self.check_balances(self.j.data["play_amount_usdc"]):
+            log.error("Wallet balance verification failed; refusing to start live.")
+            sys.exit(1)
 
-        while self.j.data["cycle"] < self.cfg.MAX_CYCLES:
+        completed_this_run = 0
+        while self.cfg.MAX_CYCLES <= 0 or completed_this_run < self.cfg.MAX_CYCLES:
             ok = self.run_cycle()
+            if ok:
+                completed_this_run += 1
             if not ok:
                 open_pos = self.j.data.get("open_position") or {}
                 if open_pos.get("dead_pool"):
@@ -947,12 +992,14 @@ class CompoundingBot:
                     )
                     time.sleep(self.cfg.DEAD_POOL_RECHECK_SEC)
                 else:
-                    log.error("Cycle failed. Pausing 60s before retry...")
-                    time.sleep(60)
+                    log.warning("No completed cycle (no candidate or quote issue). Retrying in 30s...")
+                    time.sleep(30)
 
-        log.info("\n🏁 All cycles complete!")
-        log.info(f"   Total saved:    ${self.j.data['total_saved_usdc']:.2f} USDC")
-        log.info(f"   Total winnings: ${self.j.data['total_winnings_usdc']:.2f} USDC")
+        log.info("\n🏁 Cycle limit reached for this run.")
+        log.info(f"   Completed this run: {completed_this_run}")
+        log.info(f"   Journal cycle count: {self.j.data['cycle']}")
+        log.info(f"   Paper-mode cumulative saved estimate: ${self.j.data['total_saved_usdc']:.2f} USDC")
+        log.info(f"   Paper-mode cumulative proceeds estimate: ${self.j.data['total_winnings_usdc']:.2f} USDC")
 
     def _print_projection(self):
         rows = self.calc.project(self.cfg.MAX_CYCLES)

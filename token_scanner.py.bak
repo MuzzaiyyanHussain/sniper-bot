@@ -8,6 +8,7 @@ Falls back to DexScreener polling if WebSocket is unavailable.
 
 import time
 import math
+import re
 import asyncio
 import logging
 import json
@@ -16,6 +17,25 @@ import websockets
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
+
+
+def parse_sol_amount(event: dict, max_reasonable_sol: float = 1_000.0) -> float | None:
+    """Return the documented SOL-spend field, or None when it is absent.
+
+    PumpPortal's `initialBuy` is a token amount, not SOL. This function never
+    falls back to it. Invalid supplied values raise ValueError so callers can
+    skip that event rather than silently trusting a zero.
+    """
+    raw = event.get("solAmount")
+    if raw is None:
+        return None
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid solAmount: {raw!r}") from exc
+    if not math.isfinite(amount) or amount < 0 or amount > max_reasonable_sol:
+        raise ValueError(f"implausible solAmount: {raw!r}")
+    return amount
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -53,7 +73,7 @@ class ScannerConfig:
 
     # Allowed DEXes
     allowed_dexes: list = field(default_factory=lambda: [
-        "raydium", "orca", "meteora", "pump.fun", "fluxbeam", "pumpswap"
+        "raydium", "orca", "meteora", "pump.fun", "pumpfun", "pumpswap", "fluxbeam"
     ])
 
     # WebSocket settings
@@ -61,6 +81,7 @@ class ScannerConfig:
         "wss://pumpportal.fun/api/data",   # primary — free, no key
         "wss://pumpdev.io/ws",             # fallback
     ])
+    max_parallel_evaluations: int = 4
 
     # How long to wait for DexScreener pair data after token launch (seconds)
     pair_wait_sec:        int   = 25
@@ -96,7 +117,7 @@ class TokenCandidate:
     top10_pct:       float = 0.0
     score:           float = 0.0
     url:             str   = ""
-    initial_buy_sol: float = 0.0   # dev's initial buy at launch
+    initial_buy_sol: float | None = None   # SOL spent by creator, if supplied by the event
 
     @property
     def buy_sell_ratio(self) -> float:
@@ -170,14 +191,15 @@ class TokenScorer:
         elif 50_000 < t.liquidity_usd <= 200_000:
             s += 10
 
-        # Initial buy check (0-10)
-        # Small initial buy = fairer launch
-        if t.initial_buy_sol == 0 or t.initial_buy_sol < 1:
-            s += 10
-        elif t.initial_buy_sol < 5:
-            s += 6
-        elif t.initial_buy_sol < 20:
-            s += 3
+        # Initial buy check (0-10). Unknown is neutral: do not treat missing
+        # event data as a zero-SOL creator buy.
+        if t.initial_buy_sol is not None:
+            if t.initial_buy_sol < 1:
+                s += 10
+            elif t.initial_buy_sol < 5:
+                s += 6
+            elif t.initial_buy_sol < 20:
+                s += 3
 
         return round(s, 2)
 
@@ -192,19 +214,81 @@ class DexScreenerClient:
         self.session = requests.Session()
         self.session.headers.update(self.HEADERS)
 
-    def get_pairs_for_mint(self, mint: str) -> list:
+
+def get_pairs_for_mint(self, mint: str) -> list:
+    """Fetch pairs and distinguish API failures from valid empty results."""
+    try:
+        resp = self.session.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if not isinstance(data, dict):
+            log.warning(
+                "DexScreener unexpected response for %s: expected object",
+                mint[:8],
+            )
+            return []
+
+        pairs = data.get("pairs")
+        if pairs is None:
+            return []
+
+        if not isinstance(pairs, list):
+            log.warning(
+                "DexScreener invalid pairs field for %s",
+                mint[:8],
+            )
+            return []
+
+        return pairs
+
+    except requests.RequestException as e:
+        log.warning(
+            "DexScreener HTTP/network failure for %s: %s: %s",
+            mint[:8], type(e).__name__, e,
+        )
+        return []
+    except ValueError as e:
+        log.warning(
+            "DexScreener invalid JSON for %s: %s",
+            mint[:8], e,
+        )
+        return []
+
+        """Fetch pairs for a mint; log API failures so they aren't mistaken for no pairs."""
         try:
             resp = self.session.get(
                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                timeout=8,
+                timeout=5,
             )
             resp.raise_for_status()
-            return resp.json().get("pairs") or []
+            data = resp.json()
+            if not isinstance(data, dict):
+                log.warning(
+                    "DexScreener returned an unexpected response for %s",
+                    mint[:8],
+                )
+                return []
+
+            pairs = data.get("pairs") or []
+            if not isinstance(pairs, list):
+                log.warning(
+                    "DexScreener returned an invalid pairs field for %s",
+                    mint[:8],
+                )
+                return []
+            return pairs
         except Exception as e:
-            log.debug(f"DexScreener error for {mint[:8]}: {e}")
+            log.warning(
+                "DexScreener request failed for %s: %s: %s",
+                mint[:8], type(e).__name__, e,
+            )
             return []
 
-    def parse_pair(self, pair: dict, initial_buy_sol: float = 0) -> "TokenCandidate | None":
+    def parse_pair(self, pair: dict, initial_buy_sol: float | None = None, expected_mint: str | None = None) -> "TokenCandidate | None":
         try:
             if pair.get("chainId") != "solana":
                 return None
@@ -212,11 +296,55 @@ class DexScreenerClient:
             mint = base.get("address", "")
             if not mint:
                 return None
+            if expected_mint and mint.lower() != expected_mint.lower():
+                return None
 
             created_at = pair.get("pairCreatedAt")
-            age_min = ((time.time() - created_at / 1000) / 60) if created_at else 999
+            now_ms = time.time() * 1000
+            if created_at is not None:
+                try:
+                    created_at = float(created_at)
+                except (TypeError, ValueError):
+                    log.warning("Invalid pairCreatedAt for mint %s", mint[:8])
+                    return None
+                # Reject clearly future-dated pair timestamps instead of treating
+                # them as a fresh token. A small clock/API tolerance is allowed.
+                if not math.isfinite(created_at) or created_at > now_ms + 5 * 60 * 1000:
+                    log.warning(
+                        "Future/invalid pairCreatedAt for %s; skipping pair",
+                        mint[:8],
+                    )
+                    return None
+                age_min = max(0.0, (now_ms - created_at) / 60_000)
+            else:
+                age_min = 999.0
 
-            liquidity  = pair.get("liquidity", {}).get("usd", 0) or 0
+            liquidity_data = pair.get("liquidity")
+            liquidity_raw = (
+                liquidity_data.get("usd")
+                if isinstance(liquidity_data, dict)
+                else None
+            )
+            if liquidity_raw is None:
+                log.warning(
+        "SKIP-CANDIDATE: liquidity unavailable from DexScreener "
+        "| mint=%s | dex=%s | pair=%s | price_usd=%s "
+        "| eligibility=FAIL-CLOSED",
+                   mint,
+                   pair.get("dexId", "unknown"),
+                   pair.get("pairAddress", "unknown"),
+                   pair.get("priceUsd", "unknown"),
+         )
+                liquidity = 0.0
+            else:
+                try:
+                    liquidity = float(liquidity_raw)
+                except (TypeError, ValueError):
+                    log.warning("Invalid liquidity value for %s; skipping pair", mint[:8])
+                    return None
+                if not math.isfinite(liquidity) or liquidity < 0:
+                    log.warning("Invalid liquidity value for %s; skipping pair", mint[:8])
+                    return None
             volume     = pair.get("volume", {})
             price_chg  = pair.get("priceChange", {})
             txns       = pair.get("txns", {})
@@ -286,102 +414,179 @@ class PumpFunListener:
             return False, f"sell pressure ({t.buy_sell_ratio:.1f}x)"
         if t.dex not in cfg.allowed_dexes:
             return False, f"unknown dex ({t.dex})"
-        if t.initial_buy_sol > cfg.max_initial_buy_sol:
+        if (t.initial_buy_sol is not None
+                and t.initial_buy_sol > cfg.max_initial_buy_sol):
             return False, f"dev bought too much ({t.initial_buy_sol:.1f} SOL)"
         return True, ""
 
     def _evaluate_mint(self, mint: str, name: str, symbol: str,
-                       initial_buy_sol: float) -> "TokenCandidate | None":
-        """
-        Wait for DexScreener to index the pair, then evaluate.
-        Called after WebSocket notifies us of a new token.
-        """
-        log.info(f"   ⏳ Waiting {self.cfg.pair_wait_sec}s for pair data — {symbol} ({mint[:8]}...)")
-        time.sleep(self.cfg.pair_wait_sec)
+                       initial_buy_sol: float | None) -> "TokenCandidate | None":
+        """Wait for DexScreener pair data, then evaluate the token."""
+        log.info("   🔎 Checking pair data — %s (%s...)", symbol, mint[:8])
 
-        pairs = self.dex.get_pairs_for_mint(mint)
-        if not pairs:
-            log.info(f"   ⚠️  No pairs found for {symbol} yet — skipping")
+        # Honor the configured wait. The HTTP request itself has a bounded timeout.
+        deadline = time.monotonic() + max(1, self.cfg.pair_wait_sec)
+        matching_pairs = []
+
+        while time.monotonic() < deadline:
+            pairs = self.dex.get_pairs_for_mint(mint)
+            matching_pairs = [
+                pair for pair in pairs
+                if pair.get("chainId") == "solana"
+                and (pair.get("baseToken", {}).get("address") or "").lower()
+                == mint.lower()
+            ]
+            if matching_pairs:
+                break
+
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(1.0, remaining))
+
+        if not matching_pairs:
+            log.info(
+                "   ⚠️ No matching pairs found for %s after retries — skipping",
+                symbol,
+            )
             return None
 
-        # Pick the pair with most liquidity
-        pairs_sol = [p for p in pairs if p.get("chainId") == "solana"]
-        if not pairs_sol:
-            return None
-        best_pair = max(pairs_sol, key=lambda p: p.get("liquidity", {}).get("usd", 0) or 0)
+        # Evaluate each exact-mint pair independently. An old/high-liquidity
+        # pool must not hide another pair that may pass the existing filters.
+        eligible = []
 
-        t = self.dex.parse_pair(best_pair, initial_buy_sol)
-        if not t:
+        for pair in matching_pairs:
+            candidate = self.dex.parse_pair(
+                pair, initial_buy_sol, expected_mint=mint
+            )
+            if candidate is None:
+                continue
+
+            is_rug, reason = self.rug.check(candidate)
+            if is_rug:
+                log.warning(
+                    "   RUG detected %s on %s: %s",
+                    symbol, candidate.dex, reason
+                )
+                continue
+
+            ok, reason = self._passes_filters(candidate)
+            if not ok:
+                log.info(
+                    "   SKIP %s on %s: %s",
+                    symbol, candidate.dex, reason
+                )
+                continue
+
+            candidate.score = self.scorer.score(candidate)
+            eligible.append(candidate)
+
+        if not eligible:
             return None
 
-        # Rug check
-        is_rug, reason = self.rug.check(t)
-        if is_rug:
-            log.warning(f"   🚨 RUG detected {symbol}: {reason}")
-            return None
-
-        # Filter check
-        ok, reason = self._passes_filters(t)
-        if not ok:
-            log.info(f"   SKIP {symbol}: {reason}")
-            return None
-
-        t.score = self.scorer.score(t)
-        return t
+        return max(eligible, key=lambda candidate: candidate.score)
 
     async def _listen_ws(self, endpoint: str, result_queue: asyncio.Queue,
                          stop_event: asyncio.Event):
-        """Connect to WebSocket and push qualifying tokens to queue."""
+        """Connect to PumpPortal and evaluate new-token events concurrently."""
         log.info(f"📡 Connecting to {endpoint}...")
+        if not hasattr(self, "_pending_mints"):
+            self._pending_mints = set()
+            self._eval_semaphore = asyncio.Semaphore(self.cfg.max_parallel_evaluations)
+            self._eval_tasks = set()
+
         try:
             async with websockets.connect(endpoint, ping_interval=20,
                                           ping_timeout=10) as ws:
-                # Subscribe to new token events
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 log.info("   ✅ Subscribed to new token launches")
 
                 while not stop_event.is_set():
                     try:
                         msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                    except asyncio.TimeoutError:
+                        await ws.ping()
+                        continue
+
+                    try:
                         data = json.loads(msg)
-
-                        # PumpPortal format
+                        if not isinstance(data, dict):
+                            raise ValueError("WebSocket event must be a JSON object")
                         tx_type = data.get("txType") or data.get("type", "")
-                        mint    = data.get("mint") or data.get("address", "")
-                        name    = data.get("name", "Unknown")
-                        symbol  = data.get("symbol", "???")
-                        sol_amt = float(data.get("solAmount") or data.get("initialBuy", 0) or 0)
-
-                        if not mint:
+                        mint = data.get("mint") or data.get("address", "")
+                        name = str(data.get("name") or "Unknown")
+                        symbol = str(data.get("symbol") or "???")
+                        if not isinstance(mint, str) or not mint.strip():
+                            log.debug("Skipping WebSocket event without a mint")
                             continue
 
-                        if tx_type in ("create", "mint", "") or "mint" in data:
-                            log.info(f"\n🚀 NEW TOKEN: {symbol} ({name})")
-                            log.info(f"   Mint:        {mint}")
-                            log.info(f"   Initial buy: {sol_amt:.2f} SOL")
+                        # PumpPortal's creation event uses `initialBuy` for the
+                        # token amount and `solAmount` for SOL spent. Never use
+                        # initialBuy as a SOL fallback. Missing solAmount remains
+                        # unknown; malformed or absurd values reject this event.
+                        try:
+                            sol_amt = parse_sol_amount(data)
+                        except ValueError as e:
+                            log.warning("Skipping %s: %s", symbol, e)
+                            continue
 
-                            # Evaluate in background so we don't block the WS
-                            loop = asyncio.get_event_loop()
-                            candidate = await loop.run_in_executor(
-                                None,
-                                self._evaluate_mint,
-                                mint, name, symbol, sol_amt
-                            )
+                        if not (tx_type in ("create", "mint", "") or "mint" in data):
+                            continue
 
-                            if candidate:
-                                await result_queue.put(candidate)
-                                if stop_event.is_set():
-                                    break
+                        log.info("\n🚀 NEW TOKEN: %s (%s)", symbol, name)
+                        log.info("   Mint:        %s", mint)
+                        if sol_amt is None:
+                            log.info("   Initial buy: unknown (solAmount not supplied)")
+                        else:
+                            log.info("   Initial buy: %.4f SOL", sol_amt)
 
-                    except asyncio.TimeoutError:
-                        # Send ping to keep connection alive
-                        await ws.ping()
+                        if mint in self._pending_mints:
+                            continue
+                        self._pending_mints.add(mint)
+
+                        async def evaluate_and_queue(token_mint, token_name, token_symbol, token_sol_amt):
+                            try:
+                                async with self._eval_semaphore:
+                                    if stop_event.is_set():
+                                        return
+                                    loop = asyncio.get_running_loop()
+                                    candidate = await loop.run_in_executor(
+                                        None, self._evaluate_mint, token_mint, token_name,
+                                        token_symbol, token_sol_amt,
+                                    )
+                                    if candidate and not stop_event.is_set():
+                                        await result_queue.put(candidate)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception:
+                                log.exception("Token evaluation failed for %s", token_mint)
+                            finally:
+                                self._pending_mints.discard(token_mint)
+
+                        task = asyncio.create_task(
+                            evaluate_and_queue(mint, name, symbol, sol_amt)
+                        )
+                        self._eval_tasks.add(task)
+                        task.add_done_callback(self._eval_tasks.discard)
+                    except (json.JSONDecodeError, ValueError, TypeError) as e:
+                        # Bad individual messages must not tear down the socket.
+                        log.warning("Skipping malformed WebSocket message: %s", e)
                     except Exception as e:
-                        log.warning(f"   WS message error: {e}")
-                        break
+                        log.warning("   WS message processing error: %s", e)
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            log.warning(f"   WS connection failed ({endpoint}): {e}")
+            log.warning("   WS connection failed (%s): %s", endpoint, e)
+        finally:
+            # When the scan ends, stop async evaluations and wait for them. Any
+            # executor work already running cannot be forcibly killed; the pair
+            # lookup itself has bounded request/retry timeouts.
+            if stop_event.is_set():
+                tasks = list(getattr(self, "_eval_tasks", set()))
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _listen_with_fallback(self, result_queue: asyncio.Queue,
                                     stop_event: asyncio.Event):
@@ -441,7 +646,7 @@ class PumpFunListener:
                 seen.add(mint)
                 pairs = self.dex.get_pairs_for_mint(mint)
                 for pair in pairs:
-                    t = self.dex.parse_pair(pair, 0)
+                    t = self.dex.parse_pair(pair, None, expected_mint=mint)
                     if not t:
                         continue
                     is_rug, _ = self.rug.check(t)
@@ -467,6 +672,12 @@ class PumpFunListener:
         result = [None]
 
         async def runner():
+            # Each find_best call owns fresh asyncio primitives; reusing a
+            # semaphore across asyncio.run() event loops can bind it to an
+            # already-closed loop on later bot cycles.
+            self._pending_mints = set()
+            self._eval_semaphore = asyncio.Semaphore(self.cfg.max_parallel_evaluations)
+            self._eval_tasks = set()
             listener_task = asyncio.create_task(
                 self._listen_with_fallback(result_queue, stop_event)
             )
@@ -529,7 +740,7 @@ def _log_token(t: TokenCandidate):
     log.info(f"   Chg 5m:      {t.price_change_5m:+.1f}%")
     log.info(f"   Buys/Sells:  {t.txns_5m_buys}/{t.txns_5m_sells} ({t.buy_sell_ratio:.1f}x)")
     log.info(f"   Mcap:        ${t.market_cap:,.0f}")
-    log.info(f"   Initial buy: {t.initial_buy_sol:.2f} SOL")
+    log.info(f"   Initial buy: {t.initial_buy_sol:.2f} SOL" if t.initial_buy_sol is not None else "   Initial buy: unknown")
     log.info(f"   Score:       {t.score}/100")
     log.info(f"   URL:         {t.url}")
 

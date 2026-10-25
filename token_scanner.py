@@ -215,12 +215,12 @@ class DexScreenerClient:
         self.session.headers.update(self.HEADERS)
 
 
-    def get_pairs_for_mint(self, mint: str) -> list:
+    def get_pairs_for_mint(self, mint: str, timeout: float = 5.0) -> list:
         """Fetch pairs and distinguish API failures from valid empty results."""
         try:
             resp = self.session.get(
                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}",
-                timeout=5,
+                timeout=min(5.0, timeout),
             )
             resp.raise_for_status()
             data = resp.json()
@@ -308,8 +308,16 @@ class DexScreenerClient:
                     )
                     return None
                 age_min = max(0.0, (now_ms - created_at) / 60_000)
+                log.info(
+                    "AGE DEBUG | mint=%s | createdAt_ms=%s | now_ms=%.0f | age_min=%.2f",
+                    mint[:8], created_at, now_ms, age_min,
+                )
             else:
                 age_min = 999.0
+                log.info(
+                    "AGE DEBUG | mint=%s | createdAt_ms=missing | age_min=%.2f",
+                    mint[:8], age_min,
+                )
 
             liquidity_data = pair.get("liquidity")
             liquidity_raw = (
@@ -327,9 +335,8 @@ class DexScreenerClient:
                     pair.get("pairAddress", "unknown"),
                     pair.get("priceUsd", "unknown"),
                 )
-                liquidity = 0.0
-            else:
-                liquidity = nonnegative(liquidity_raw, "liquidity")
+                return None
+            liquidity = nonnegative(liquidity_raw, "liquidity")
 
             volume = pair.get("volume") or {}
             price_change = pair.get("priceChange") or {}
@@ -396,6 +403,160 @@ class DexScreenerClient:
             return None
 
 
+class BirdeyeHolderClient:
+    """Fetch verified Solana holder metrics; missing/invalid data stays unknown."""
+    BASE_URL = "https://public-api.birdeye.so"
+
+    def __init__(self, api_key: str, timeout: float = 6.0):
+        self.api_key = (api_key or "").strip()
+        self.timeout = timeout
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Accept": "application/json",
+            "X-API-KEY": self.api_key,
+            "x-chain": "solana",
+        })
+        self._cache: dict[str, tuple[float, int, float]] = {}
+        self.cache_ttl_sec = 30.0
+        self._rate_limit_until = 0.0
+
+    @staticmethod
+    def _find_number(obj, aliases):
+        """Search nested API payloads for a known field alias, without guessing values."""
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key.lower() in aliases and value is not None:
+                    try:
+                        number = float(value)
+                        if math.isfinite(number):
+                            return number
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+            for value in obj.values():
+                found = BirdeyeHolderClient._find_number(value, aliases)
+                if found is not None:
+                    return found
+        elif isinstance(obj, list):
+            for value in obj:
+                found = BirdeyeHolderClient._find_number(value, aliases)
+                if found is not None:
+                    return found
+        return None
+
+    def get_metrics(self, mint: str) -> tuple[int, float] | None:
+        """Return (current holder count, top-10 supply %) or None if unverified.
+
+        The API's holder_summary and top10_holder are parsed separately so a
+        tagged cohort's count/percentage cannot accidentally be mistaken for
+        total holders or top-10 concentration.
+        """
+        if not self.api_key:
+            log.debug("Birdeye API key missing; holder metrics unavailable")
+            return None
+        now = time.monotonic()
+        if now < self._rate_limit_until:
+            log.debug("Birdeye holder lookup cooldown active for %s", mint[:8])
+            return None
+        cached = self._cache.get(mint)
+        if cached and now - cached[0] < self.cache_ttl_sec:
+            return cached[1], cached[2]
+
+        try:
+            response = self.session.get(
+                f"{self.BASE_URL}/token/v1/holder-profile",
+                params={"token_address": mint, "include_zero_balance": "false"},
+                timeout=self.timeout,
+            )
+            if response.status_code == 429:
+                response_received_at = time.monotonic()
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    cooldown = max(0.0, float(retry_after))
+                except (TypeError, ValueError):
+                    cooldown = self.cache_ttl_sec
+                self._rate_limit_until = response_received_at + cooldown
+                retry_after_log = repr(retry_after)[:100]
+                log.warning(
+                    "Birdeye holder lookup rate-limited for %s; "
+                    "Retry-After=%s; cooldown %.1fs",
+                    mint[:8], retry_after_log, cooldown,
+                )
+                return None
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("success") is False:
+                return None
+            data = payload.get("data", payload)
+            if not isinstance(data, dict):
+                return None
+
+            holder_summary = data.get("holder_summary")
+            token_summary = data.get("token")
+            # Birdeye's live holder-profile response nests top-10 metrics at
+            # data.token.top10_holder (not data.top10_holder).
+            top10_summary = data.get("top10_holder")
+            if top10_summary is None and isinstance(token_summary, dict):
+                top10_summary = token_summary.get("top10_holder")
+            # API versions may expose total holder count in token or holder_summary.
+            count_aliases = {
+                "holder_count", "holdercount", "total_holder", "total_holders",
+                "totalholder", "totalholders", "holder_num", "holders_count",
+            }
+            count = self._find_number(holder_summary, count_aliases)
+            if count is None:
+                count = self._find_number(token_summary, count_aliases)
+            if count is None:
+                # Some response versions put total count directly on data.
+                count = self._find_number({k: v for k, v in data.items()
+                                           if k not in {"tags", "top10_holder", "holder_summary"}},
+                                          count_aliases)
+
+            concentration_aliases = {
+                "top10holderpercent", "top_10_holder_percent", "top10_holder_percent",
+                "top10holderpercentage", "top_10_holder_percentage", "percent_of_supply",
+                "percentage_of_supply", "supply_percent", "supply_percentage",
+            }
+            concentration = self._find_number(top10_summary, concentration_aliases)
+            if concentration is None:
+                # Explicitly named token-level concentration is also valid.
+                concentration = self._find_number(token_summary, {
+                    "top10holderpercent", "top_10_holder_percent", "top10_holder_percent",
+                })
+            if concentration is None:
+                # Optional fallback only. Some API keys cannot access token_security;
+                # that failure must not discard valid holder-profile data.
+                try:
+                    security_response = self.session.get(
+                        f"{self.BASE_URL}/defi/token_security",
+                        params={"address": mint}, timeout=self.timeout,
+                    )
+                    security_response.raise_for_status()
+                    security_payload = security_response.json()
+                    if isinstance(security_payload, dict):
+                        concentration = self._find_number(
+                            security_payload.get("data", security_payload),
+                            {"top10holderpercent", "top_10_holder_percent", "top10_holder_percent"},
+                        )
+                except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+                    log.debug("Optional token-security fallback unavailable for %s: %s", mint[:8], exc)
+
+            if (count is None or concentration is None or count < 1
+                    or not count.is_integer()):
+                log.info("Birdeye holder response lacks valid metrics for %s", mint[:8])
+                return None
+            # Values are percentages in documented responses; normalize 0..1 ratios.
+            if 0.0 <= concentration <= 1.0:
+                concentration *= 100.0
+            if not 0.0 <= concentration <= 100.0:
+                return None
+            result = (int(count), float(concentration))
+            self._cache[mint] = (now, result[0], result[1])
+            return result
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+            log.info("Birdeye holder lookup unavailable for %s: %s", mint[:8], exc)
+            return None
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # WEBSOCKET LISTENER
 # ════════════════════════════════════════════════════════════════════════════════
@@ -405,9 +566,10 @@ class PumpFunListener:
     When a token is created, waits for DexScreener pair data, then returns it.
     """
 
-    def __init__(self, cfg: ScannerConfig):
+    def __init__(self, cfg: ScannerConfig, birdeye_api_key: str = ""):
         self.cfg = cfg
         self.dex = DexScreenerClient()
+        self.holders = BirdeyeHolderClient(birdeye_api_key)
         self.rug = RugDetector()
         self.scorer = TokenScorer()
 
@@ -419,6 +581,12 @@ class PumpFunListener:
             return False, f"low liquidity (${t.liquidity_usd:,.0f})"
         if t.liquidity_usd > cfg.max_liquidity_usd:
             return False, f"liquidity too high"
+        if t.holder_count <= 0 or t.top10_pct <= 0.0:
+            return False, "holder data unavailable or unverified"
+        if t.holder_count < cfg.min_holder_count:
+            return False, f"too few holders ({t.holder_count})"
+        if t.top10_pct > cfg.max_top10_holder_pct:
+            return False, f"top-10 holders too concentrated ({t.top10_pct:.1f}%)"
         if t.volume_5m < cfg.min_volume_5m_usd:
             return False, f"low volume (${t.volume_5m:,.0f})"
         if t.price_change_5m < cfg.min_price_change_5m:
@@ -449,15 +617,24 @@ class PumpFunListener:
         deadline = time.monotonic() + max(1, self.cfg.pair_wait_sec)
         matching_pairs = []
 
-        while time.monotonic() < deadline:
-            pairs = self.dex.get_pairs_for_mint(mint)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+
+            pairs = self.dex.get_pairs_for_mint(mint, timeout=remaining)
             matching_pairs = [
                 pair for pair in pairs
                 if pair.get("chainId") == "solana"
                 and (pair.get("baseToken", {}).get("address") or "").lower()
                 == mint.lower()
             ]
-            if matching_pairs:
+            has_liquidity = any(
+                isinstance(pair.get("liquidity"), dict)
+                and pair["liquidity"].get("usd") is not None
+                for pair in matching_pairs
+            )
+            if matching_pairs and has_liquidity:
                 break
 
             remaining = deadline - time.monotonic()
@@ -481,6 +658,10 @@ class PumpFunListener:
             )
             if candidate is None:
                 continue
+
+            holder_metrics = self.holders.get_metrics(candidate.mint)
+            if holder_metrics is not None:
+                candidate.holder_count, candidate.top10_pct = holder_metrics
 
             is_rug, reason = self.rug.check(candidate)
             if is_rug:
@@ -512,6 +693,7 @@ class PumpFunListener:
         log.info(f"📡 Connecting to {endpoint}...")
         if not hasattr(self, "_pending_mints"):
             self._pending_mints = set()
+            self._evaluated_mints = set()
             self._eval_semaphore = asyncio.Semaphore(self.cfg.max_parallel_evaluations)
             self._eval_tasks = set()
 
@@ -560,7 +742,8 @@ class PumpFunListener:
                         else:
                             log.info("   Initial buy: %.4f SOL", sol_amt)
 
-                        if mint in self._pending_mints:
+                        if (mint in self._pending_mints
+                                or mint in self._evaluated_mints):
                             continue
                         self._pending_mints.add(mint)
 
@@ -582,6 +765,7 @@ class PumpFunListener:
                                 log.exception("Token evaluation failed for %s", token_mint)
                             finally:
                                 self._pending_mints.discard(token_mint)
+                                self._evaluated_mints.add(token_mint)
 
                         task = asyncio.create_task(
                             evaluate_and_queue(mint, name, symbol, sol_amt)
@@ -643,6 +827,7 @@ class PumpFunListener:
                              stop_event: asyncio.Event):
         """DexScreener polling fallback when WebSocket is unavailable."""
         seen = set()
+        liquidity_retries = {}
         while not stop_event.is_set():
             log.info("🔍 [Fallback] Polling DexScreener...")
             mints = set()
@@ -664,14 +849,42 @@ class PumpFunListener:
             for mint in mints:
                 if mint in seen or stop_event.is_set():
                     continue
-                seen.add(mint)
                 pairs = self.dex.get_pairs_for_mint(mint)
+                matching_pairs = [
+                    pair for pair in pairs
+                    if pair.get("chainId") == "solana"
+                    and (pair.get("baseToken", {}).get("address") or "").lower()
+                    == mint.lower()
+                ]
+                has_valid_liquidity = any(
+                    isinstance(pair.get("liquidity"), dict)
+                    and pair["liquidity"].get("usd") is not None
+                    for pair in matching_pairs
+                )
+                has_missing_liquidity = any(
+                    not isinstance(pair.get("liquidity"), dict)
+                    or pair["liquidity"].get("usd") is None
+                    for pair in matching_pairs
+                )
+                if has_missing_liquidity and not has_valid_liquidity:
+                    retries = liquidity_retries.get(mint, 0)
+                    if retries < 1:
+                        liquidity_retries[mint] = retries + 1
+                        continue
+                    seen.add(mint)
+                    continue
+
+                seen.add(mint)
                 for pair in pairs:
                     t = self.dex.parse_pair(pair, None, expected_mint=mint)
                     if not t:
                         continue
-                    is_rug, _ = self.rug.check(t)
+                    holder_metrics = self.holders.get_metrics(t.mint)
+                    if holder_metrics is not None:
+                        t.holder_count, t.top10_pct = holder_metrics
+                    is_rug, rug_reason = self.rug.check(t)
                     if is_rug:
+                        log.warning("   [Fallback] RUG detected %s: %s", t.symbol, rug_reason)
                         continue
                     ok, reason = self._passes_filters(t)
                     if not ok:
@@ -697,6 +910,7 @@ class PumpFunListener:
             # semaphore across asyncio.run() event loops can bind it to an
             # already-closed loop on later bot cycles.
             self._pending_mints = set()
+            self._evaluated_mints = set()
             self._eval_semaphore = asyncio.Semaphore(self.cfg.max_parallel_evaluations)
             self._eval_tasks = set()
             listener_task = asyncio.create_task(
@@ -731,7 +945,7 @@ class TokenScanner:
 
     def __init__(self, cfg: ScannerConfig, birdeye_api_key: str = ""):
         self.cfg      = cfg
-        self.listener = PumpFunListener(cfg)
+        self.listener = PumpFunListener(cfg, birdeye_api_key=birdeye_api_key)
 
     def find_best(self, max_wait_minutes: int = 15) -> "TokenCandidate | None":
         log.info("📡 Listening for new pump.fun launches via WebSocket...")
@@ -761,6 +975,7 @@ def _log_token(t: TokenCandidate):
     log.info(f"   Chg 5m:      {t.price_change_5m:+.1f}%")
     log.info(f"   Buys/Sells:  {t.txns_5m_buys}/{t.txns_5m_sells} ({t.buy_sell_ratio:.1f}x)")
     log.info(f"   Mcap:        ${t.market_cap:,.0f}")
+    log.info(f"   Holders:     {t.holder_count} | Top-10: {t.top10_pct:.1f}%")
     log.info(f"   Initial buy: {t.initial_buy_sol:.2f} SOL" if t.initial_buy_sol is not None else "   Initial buy: unknown")
     log.info(f"   Score:       {t.score}/100")
     log.info(f"   URL:         {t.url}")
