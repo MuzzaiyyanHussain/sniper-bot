@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import logging
 import math
 import os
 import tempfile
@@ -952,6 +953,13 @@ class TestLiveTradingGate(unittest.TestCase):
         validate_live_config(cfg)
         bot = CompoundingBot(cfg)
         self.assertEqual(bot.pubkey, "DRY_RUN")
+
+    def test_import_does_not_route_test_logs_to_bot_log(self):
+        self.assertFalse(any(
+            isinstance(handler, logging.FileHandler)
+            and os.path.basename(handler.baseFilename) == "bot.log"
+            for handler in logging.getLogger().handlers
+        ))
 
     def test_valid_live_config_is_accepted(self):
         validate_live_config(self.live_cfg())

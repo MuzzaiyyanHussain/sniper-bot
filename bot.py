@@ -31,15 +31,18 @@ from chain import (
 )
 
 load_dotenv()
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
 log = logging.getLogger(__name__)
+
+
+def configure_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler("bot.log"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
 
 
 def parse_bool_env(value: str, name: str = "DRY_RUN") -> bool:
@@ -1764,6 +1767,7 @@ class CompoundingBot:
 # ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    configure_logging()
     cfg = Config()
     if not cfg.DRY_RUN and not cfg.WALLET_PRIVATE_KEY:
         print("ERROR: Set WALLET_PRIVATE_KEY in .env before disabling DRY_RUN")
