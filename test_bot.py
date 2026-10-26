@@ -1,5 +1,6 @@
 """Regression tests for the Pump.fun scanner and dry-run safety helpers."""
 import asyncio
+import base64
 import json
 import math
 import os
@@ -9,14 +10,25 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import base58
+import requests
+from solders.keypair import Keypair
+
+from chain import PumpPortalLocalClient, RpcClient, RpcError, parse_bonding_curve
 from bot import (
     CompoundingBot,
     Config,
     Journal,
+    JournalCorruptError,
+    LIVE_CONFIRM_PHRASE,
+    LIVE_MAX_DAILY_LOSS_CEILING_USDC,
+    LIVE_MAX_POSITION_CEILING_USDC,
+    LiveTradingConfigError,
     PriceOracle,
     StrategyCalc,
     is_sustained_crash,
     parse_bool_env,
+    validate_live_config,
 )
 from token_scanner import (
     PumpFunListener,
@@ -185,6 +197,20 @@ class TestPumpPortalAmountParsing(unittest.TestCase):
 
 
 class TestScannerFiltersAndMintMatching(unittest.TestCase):
+    def test_max_age_filter_accepts_two_minutes_and_rejects_older_tokens(self):
+        cfg = ScannerConfig()
+        listener = PumpFunListener(cfg)
+
+        self.assertEqual(cfg.max_age_minutes, 2)
+        for age in (1.99, 2.0):
+            with self.subTest(age=age):
+                ok, reason = listener._passes_filters(make_candidate(age_minutes=age))
+                self.assertTrue(ok, reason)
+
+        ok, reason = listener._passes_filters(make_candidate(age_minutes=2.01))
+        self.assertFalse(ok)
+        self.assertIn("too old", reason)
+
     def test_actual_scanner_filter_rejects_unknown_holder_data(self):
         cfg = ScannerConfig()
         listener = PumpFunListener(cfg)
@@ -877,7 +903,1004 @@ class TestSustainedCrashBoundary(unittest.TestCase):
         self.assertFalse(is_sustained_crash([], 0.01))
 
 
+class TestLiveTradingGate(unittest.TestCase):
+    PHRASE = LIVE_CONFIRM_PHRASE
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old_cwd = os.getcwd()
+        os.chdir(self._tmp.name)
+        # Throwaway in-memory key; never funded, never leaves this process.
+        self.key = base58.b58encode(bytes(Keypair())).decode()
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+        self._tmp.cleanup()
+
+    def live_cfg(self, **overrides):
+        cfg = Config()
+        cfg.DRY_RUN = False
+        cfg.LIVE_TRADING_CONFIRM = self.PHRASE
+        cfg.MAX_POSITION_USDC = "5"
+        cfg.MAX_DAILY_LOSS_USDC = "10"
+        cfg.KILL_SWITCH_FILE = "KILL_SWITCH"
+        cfg.WALLET_PRIVATE_KEY = self.key
+        cfg.STARTING_AMOUNT_USDC = 2.0
+        cfg.MIN_PLAY_AMOUNT = 1.0
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        return cfg
+
+    def live_bot(self, **overrides):
+        # Live-mode startup requires a deliberate, existing journal.
+        Journal().save()
+        bot = CompoundingBot(self.live_cfg(**overrides))
+        bot.check_balances = MagicMock(return_value=True)
+        bot.scanner.find_best = MagicMock(return_value=make_candidate())
+        return bot
+
+    def test_dry_run_is_the_default_and_needs_no_live_settings(self):
+        with patch.dict(os.environ):
+            os.environ.pop("DRY_RUN", None)
+            self.assertTrue(parse_bool_env(os.getenv("DRY_RUN", "true")))
+        cfg = Config()
+        cfg.DRY_RUN = True
+        cfg.LIVE_TRADING_CONFIRM = ""
+        cfg.MAX_POSITION_USDC = ""
+        cfg.MAX_DAILY_LOSS_USDC = ""
+        cfg.WALLET_PRIVATE_KEY = ""
+        validate_live_config(cfg)
+        bot = CompoundingBot(cfg)
+        self.assertEqual(bot.pubkey, "DRY_RUN")
+
+    def test_valid_live_config_is_accepted(self):
+        validate_live_config(self.live_cfg())
+
+    def test_wrong_or_missing_confirmation_is_refused(self):
+        for value in ("", "yes", self.PHRASE.lower(), self.PHRASE + " ", None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(LiveTradingConfigError, "LIVE_TRADING_CONFIRM"):
+                    validate_live_config(self.live_cfg(LIVE_TRADING_CONFIRM=value))
+
+    def test_invalid_max_position_is_refused(self):
+        bad = ("", "  ", None, "abc", "0", "-1", "nan", "inf", "-inf", True, "100.01", "1e9")
+        for value in bad:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(LiveTradingConfigError, "MAX_POSITION_USDC"):
+                    validate_live_config(self.live_cfg(MAX_POSITION_USDC=value))
+
+    def test_invalid_daily_loss_cap_is_refused(self):
+        bad = ("", "  ", None, "abc", "0", "-5", "nan", "inf", True, "500.01")
+        for value in bad:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(LiveTradingConfigError, "MAX_DAILY_LOSS_USDC"):
+                    validate_live_config(self.live_cfg(MAX_DAILY_LOSS_USDC=value))
+
+    def test_ceiling_values_are_accepted(self):
+        validate_live_config(self.live_cfg(
+            MAX_POSITION_USDC=str(LIVE_MAX_POSITION_CEILING_USDC),
+            MAX_DAILY_LOSS_USDC=str(LIVE_MAX_DAILY_LOSS_CEILING_USDC),
+        ))
+
+    def test_missing_wallet_key_or_kill_switch_path_is_refused(self):
+        with self.assertRaisesRegex(LiveTradingConfigError, "WALLET_PRIVATE_KEY"):
+            validate_live_config(self.live_cfg(WALLET_PRIVATE_KEY=""))
+        for value in ("", "  ", None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(LiveTradingConfigError, "KILL_SWITCH_FILE"):
+                    validate_live_config(self.live_cfg(KILL_SWITCH_FILE=value))
+
+    def test_starting_amount_above_position_limit_is_refused(self):
+        with self.assertRaisesRegex(LiveTradingConfigError, "STARTING_AMOUNT_USDC"):
+            validate_live_config(self.live_cfg(STARTING_AMOUNT_USDC=6.0))
+
+    def test_bot_construction_refuses_invalid_live_config(self):
+        with self.assertRaises(LiveTradingConfigError):
+            CompoundingBot(self.live_cfg(MAX_POSITION_USDC=""))
+        self.assertIsNotNone(self.live_bot())
+
+    def test_refusal_message_does_not_leak_secrets(self):
+        secret_phrase = "super-secret-wrong-phrase"
+        with self.assertRaises(LiveTradingConfigError) as ctx:
+            validate_live_config(self.live_cfg(
+                LIVE_TRADING_CONFIRM=secret_phrase, MAX_POSITION_USDC=""))
+        message = str(ctx.exception)
+        self.assertNotIn(secret_phrase, message)
+        self.assertNotIn(self.key, message)
+
+    def test_kill_switch_blocks_new_live_entry_and_scan(self):
+        bot = self.live_bot()
+        open("KILL_SWITCH", "w").close()
+        bot.execute_buy = MagicMock()
+        self.assertFalse(bot.run_cycle())
+        bot.scanner.find_best.assert_not_called()
+        bot.execute_buy.assert_not_called()
+
+    def test_kill_switch_blocks_execute_buy_directly(self):
+        bot = self.live_bot()
+        open("KILL_SWITCH", "w").close()
+        bot.jup.get_quote = MagicMock()
+        with self.assertRaisesRegex(LiveTradingConfigError, "Kill switch"):
+            bot.execute_buy(1.0, make_candidate())
+        bot.jup.get_quote.assert_not_called()
+
+    def test_kill_switch_does_not_affect_dry_run(self):
+        cfg = Config()
+        cfg.DRY_RUN = True
+        bot = CompoundingBot(cfg)
+        open("KILL_SWITCH", "w").close()
+        bot.scanner.find_best = MagicMock(return_value=None)
+        bot.run_cycle()
+        bot.scanner.find_best.assert_called_once()
+
+    def test_execute_buy_refuses_amount_over_position_limit(self):
+        bot = self.live_bot()
+        bot.jup.get_quote = MagicMock()
+        with self.assertRaisesRegex(LiveTradingConfigError, "MAX_POSITION_USDC"):
+            bot.execute_buy(5.01, make_candidate())
+        bot.jup.get_quote.assert_not_called()
+
+    def test_compounded_play_amount_is_capped_at_position_limit(self):
+        bot = self.live_bot()
+        bot.j.data["play_amount_usdc"] = 50.0
+        bot.execute_buy = MagicMock(return_value=None)
+        bot.run_cycle()
+        self.assertEqual(bot.execute_buy.call_args.args[0], 5.0)
+        bot.check_balances.assert_called_once_with(5.0)
+
+    def test_daily_loss_cap_blocks_new_entries(self):
+        bot = self.live_bot()
+        bot.j.record_pnl(-10.0)
+        bot.execute_buy = MagicMock()
+        self.assertFalse(bot.run_cycle())
+        bot.scanner.find_best.assert_not_called()
+        bot.execute_buy.assert_not_called()
+
+    def test_loss_below_cap_still_allows_entry(self):
+        bot = self.live_bot()
+        bot.j.record_pnl(-9.99)
+        bot.execute_buy = MagicMock(return_value=None)
+        bot.run_cycle()
+        bot.execute_buy.assert_called_once()
+
+    def test_daily_loss_resets_on_a_new_day(self):
+        journal = Journal()
+        journal.data["daily_pnl"] = {"date": "2000-01-01", "pnl_usdc": -999.0}
+        self.assertEqual(journal.realized_pnl_today(), 0.0)
+
+    def test_completed_cycle_records_realized_pnl(self):
+        cfg = Config()
+        cfg.DRY_RUN = True
+        bot = CompoundingBot(cfg)
+        bot.scanner.find_best = MagicMock(return_value=make_candidate())
+        bot.execute_buy = MagicMock(return_value={
+            "buy_tx": "sig", "usdc_spent": 2.0, "token_amount": 1.0,
+            "token_decimals": 6, "token_symbol": "T", "entry_price": 2.0,
+            "target_price": 4.0, "stop_price": 1.6, "token_mint": "MintX",
+            "dex_url": "",
+        })
+        bot.monitor_price = MagicMock(return_value=("stop_loss", 1.0))
+        bot.execute_sell = MagicMock(return_value=1.5)
+        self.assertTrue(bot.run_cycle())
+        self.assertAlmostEqual(bot.j.realized_pnl_today(), -0.5)
+
+
+class FakeRpc:
+    def __init__(self):
+        self.balances = {}
+        self.height = 1000
+        self.status = None
+        self.fail_balance = False
+        self.fail_status = False
+        self.sol = 1_000_000_000
+        self.tx_delta = None
+        self.fail_tx = False
+        self.account = None
+        self.fail_account = False
+
+    def sol_balance(self, owner):
+        return self.sol
+
+    def transaction_sol_delta(self, sig, owner):
+        if self.fail_tx:
+            raise RpcError("metadata unavailable")
+        return self.tx_delta
+
+    def account_data(self, address):
+        if self.fail_account:
+            raise RpcError("account down")
+        return self.account
+
+    def token_balance(self, owner, mint):
+        if self.fail_balance:
+            raise RpcError("balance down")
+        return self.balances.get(mint, 0)
+
+    def block_height(self):
+        return self.height
+
+    def signature_status(self, sig):
+        if self.fail_status:
+            raise RpcError("status down")
+        return self.status
+
+
+class TestJournalIntegrity(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._old = os.getcwd()
+        os.chdir(self._tmp.name)
+
+    def tearDown(self):
+        os.chdir(self._old)
+        self._tmp.cleanup()
+
+    def test_save_is_atomic_and_keeps_backup(self):
+        j = Journal()
+        j.data["cycle"] = 1
+        j.save()
+        j.data["cycle"] = 2
+        j.save()
+        self.assertFalse(os.path.exists("journal.json.tmp"))
+        with open("journal.json") as f:
+            self.assertEqual(json.load(f)["cycle"], 2)
+        with open("journal.json.bak") as f:
+            self.assertEqual(json.load(f)["cycle"], 1)
+
+    def test_dry_run_recovers_corrupt_journal_from_backup(self):
+        j = Journal()
+        j.data["cycle"] = 7
+        j.save()
+        j.save()
+        with open("journal.json", "w") as f:
+            f.write('{"cycle": 8, "tru')
+        recovered = Journal(strict=False)
+        self.assertEqual(recovered.data["cycle"], 7)
+        self.assertTrue(any(n.startswith("journal.json.corrupt-") for n in os.listdir(".")))
+
+    def test_dry_run_corrupt_without_backup_starts_fresh(self):
+        with open("journal.json", "w") as f:
+            f.write("not json")
+        self.assertEqual(Journal(strict=False).data["cycle"], 0)
+
+    def test_live_mode_refuses_corrupt_journal_and_leaves_it_untouched(self):
+        with open("journal.json", "w") as f:
+            f.write("{broken")
+        with self.assertRaises(JournalCorruptError):
+            Journal(strict=True)
+        with open("journal.json") as f:
+            self.assertEqual(f.read(), "{broken")
+
+    def test_live_mode_refuses_missing_journal(self):
+        with self.assertRaisesRegex(JournalCorruptError, "is missing"):
+            Journal(strict=True)
+
+    def test_live_mode_refuses_valid_json_with_invalid_transaction_state(self):
+        with open("journal.json", "w") as f:
+            json.dump({"cycle": 0, "pending_tx": {"state": "sent"}}, f)
+        with self.assertRaisesRegex(JournalCorruptError, "unreadable"):
+            Journal(strict=True)
+
+
+class TestTransactionReconciliation(TestLiveTradingGate):
+    USDC = None
+
+    def setUp(self):
+        super().setUp()
+        self.bot = self.live_bot(CONFIRM_MAX_WAIT_SEC=0, CONFIRM_POLL_SEC=0.1)
+        self.rpc = FakeRpc()
+        self.bot.rpc = self.rpc
+        self.cand = make_candidate()
+        self.usdc = self.bot.cfg.INPUT_MINT
+        self.rpc.balances = {self.usdc: 10_000_000}
+        self.bot.oracle.get_token_decimals = MagicMock(return_value=6)
+        jup = MagicMock()
+        jup.get_quote.return_value = {"outAmount": "1000000000"}
+        jup.build_swap_transaction.return_value = "rawtx"
+        jup.sign_transaction.return_value = ("signed", "SIG1")
+        self.bot.jup = jup
+        self.confirmed = {"confirmationStatus": "confirmed", "err": None}
+
+    def land_buy(self, *_):
+        self.rpc.balances[self.cand.mint] = 1_000_000_000
+        self.rpc.balances[self.usdc] = 8_000_000
+        self.rpc.status = self.confirmed
+
+    def test_buy_is_journaled_before_send_and_fills_from_chain(self):
+        seen = {}
+
+        def submit(signed):
+            with open("journal.json") as f:
+                seen["pending"] = json.load(f)["pending_tx"]
+            self.land_buy()
+            return "SIG1"
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        pos = self.bot.execute_buy(2.0, self.cand)
+        self.assertEqual(seen["pending"]["signature"], "SIG1")
+        self.assertEqual(seen["pending"]["state"], "sent")
+        self.assertEqual(pos["fill_source"], "onchain")
+        self.assertAlmostEqual(pos["token_amount"], 1000.0)
+        self.assertAlmostEqual(pos["usdc_spent"], 2.0)
+        self.assertIsNone(self.bot.j.data["pending_tx"])
+
+    def test_direct_buy_is_refused_while_position_is_open(self):
+        self.bot.j.data["open_position"] = self.position()
+        with self.assertLogs("bot", level="ERROR"):
+            self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.bot.jup.get_quote.assert_not_called()
+
+    def test_actual_fill_differs_from_quote(self):
+        def submit(signed):
+            self.land_buy()
+            self.rpc.balances[self.cand.mint] = 500_000_000
+            return "SIG1"
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        pos = self.bot.execute_buy(2.0, self.cand)
+        self.assertAlmostEqual(pos["token_amount"], 500.0)
+        self.assertAlmostEqual(pos["entry_price"], 0.004)
+        self.assertAlmostEqual(pos["quoted_token_amount"], 1000.0)
+
+    def test_confirm_timeout_leaves_unknown_and_blocks_new_buy(self):
+        self.bot.jup.submit_encoded.return_value = "SIG1"
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "unknown")
+        self.bot.jup.build_swap_transaction.reset_mock()
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.bot.jup.build_swap_transaction.assert_not_called()
+        self.assertFalse(self.bot.run_cycle())
+
+    def test_blockhash_expiry_clears_only_after_expiry_height(self):
+        self.bot.jup.submit_encoded.return_value = "SIG1"
+        self.bot.execute_buy(2.0, self.cand)
+        self.rpc.height = 1150
+        self.assertEqual(self.bot.reconcile_pending()["state"], "unknown")
+        self.rpc.height = 1151
+        self.assertEqual(self.bot.reconcile_pending()["state"], "failed")
+        self.assertIsNone(self.bot.j.data["pending_tx"])
+
+    def test_onchain_error_clears_pending(self):
+        self.rpc.status = {"confirmationStatus": "confirmed", "err": {"x": 1}}
+        self.bot.jup.submit_encoded.return_value = "SIG1"
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.assertIsNone(self.bot.j.data["pending_tx"])
+
+    def test_legacy_finalized_status_is_confirmed(self):
+        self.rpc.status = {"confirmations": None, "err": None}
+
+        def submit(_signed):
+            self.rpc.balances[self.cand.mint] = 1_000_000_000
+            self.rpc.balances[self.usdc] = 8_000_000
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        position = self.bot.execute_buy(2.0, self.cand)
+        self.assertIsNotNone(position)
+
+    def test_processed_failure_is_not_treated_as_final(self):
+        self.rpc.status = {"confirmationStatus": "processed", "err": {"x": 1}}
+        self.bot.jup.submit_encoded.return_value = "SIG1"
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "unknown")
+
+    def test_rpc_error_while_settling_stays_unknown(self):
+        self.rpc.fail_status = True
+        self.bot.jup.submit_encoded.return_value = "SIG1"
+        self.bot.execute_buy(2.0, self.cand)
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "unknown")
+
+    def test_unreadable_pre_balance_sends_nothing(self):
+        self.rpc.fail_balance = True
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.bot.jup.submit_encoded.assert_not_called()
+        self.assertIsNone(self.bot.j.data.get("pending_tx"))
+
+    def test_rpc_rejection_is_reconciled_instead_of_clearing_pending(self):
+        self.bot.jup.submit_encoded.side_effect = RuntimeError("RPC error: nope")
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "unknown")
+
+    def test_ambiguous_send_error_is_settled_by_signature_not_resent(self):
+        def submit(signed):
+            self.land_buy()
+            raise requests.ConnectionError("reset")
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        pos = self.bot.execute_buy(2.0, self.cand)
+        self.assertIsNotNone(pos)
+        self.assertEqual(self.bot.jup.submit_encoded.call_count, 1)
+
+    def test_restart_recovers_pending_buy_without_rebuilding(self):
+        self.bot.jup.submit_encoded.return_value = "SIG1"
+        self.bot.execute_buy(2.0, self.cand)
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "unknown")
+
+        restarted = CompoundingBot(self.live_cfg(CONFIRM_MAX_WAIT_SEC=0))
+        restarted.rpc = self.rpc
+        restarted.jup = MagicMock()
+        self.assertEqual(restarted.j.data["pending_tx"]["signature"], "SIG1")
+        self.land_buy()
+        res = restarted.reconcile_pending()
+        self.assertEqual(res["state"], "confirmed")
+        self.assertAlmostEqual(restarted.j.data["open_position"]["token_amount"], 1000.0)
+        restarted.jup.build_swap_transaction.assert_not_called()
+        restarted.jup.submit_encoded.assert_not_called()
+
+    def test_confirmed_buy_with_mismatched_balances_is_flagged(self):
+        def submit(signed):
+            self.rpc.status = self.confirmed
+            return "SIG1"
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "anomaly")
+        self.assertIsNone(self.bot.j.data.get("open_position"))
+        self.assertFalse(self.bot.run_cycle())
+
+    def position(self):
+        return {
+            "buy_tx": "B", "usdc_spent": 2.0, "token_amount": 1000.0,
+            "token_decimals": 6, "token_symbol": "TKN", "entry_price": 0.002,
+            "target_price": 0.004, "stop_price": 0.0016,
+            "token_mint": self.cand.mint, "dex_url": "",
+        }
+
+    def test_sell_uses_onchain_balance_and_books_actual_proceeds(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+        self.bot.jup.get_quote.return_value = {"outAmount": "3000000"}
+
+        def submit(signed):
+            self.rpc.balances[self.cand.mint] = 0
+            self.rpc.balances[self.usdc] += 2_500_000
+            self.rpc.status = self.confirmed
+            return "SIG1"
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        proceeds = self.bot.execute_sell(pos, "target")
+        self.assertAlmostEqual(proceeds, 2.5)
+        self.assertEqual(self.bot.jup.get_quote.call_args[0][2], 900_000_000)
+        self.assertIsNone(self.bot.j.data["open_position"])
+        self.assertEqual(self.bot.j.data["cycle"], 1)
+        self.assertAlmostEqual(self.bot.j.realized_pnl_today(), 0.5)
+
+    def test_sell_never_resends_while_previous_is_unknown(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 1_000_000_000
+        self.bot.jup.get_quote.return_value = {"outAmount": "3000000"}
+        self.bot.jup.submit_encoded.return_value = "SIG1"
+        self.assertIsNone(self.bot.execute_sell(pos, "stop_loss"))
+        self.assertEqual(self.bot.jup.submit_encoded.call_count, 1)
+        self.assertIsNone(self.bot.execute_sell(pos, "stop_loss"))
+        self.assertEqual(self.bot.jup.submit_encoded.call_count, 1)
+
+    def test_sell_retries_with_new_tx_only_after_proven_failure(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 1_000_000_000
+        self.bot.jup.get_quote.return_value = {"outAmount": "3000000"}
+        self.bot.jup.sign_transaction.side_effect = [("s1", "SIG1"), ("s2", "SIG2")]
+        calls = []
+
+        def submit(signed):
+            calls.append(signed)
+            if signed == "s1":
+                self.rpc.status = {"confirmationStatus": "confirmed", "err": {"e": 1}}
+            else:
+                self.rpc.balances[self.cand.mint] = 0
+                self.rpc.balances[self.usdc] += 2_000_000
+                self.rpc.status = self.confirmed
+            return "x"
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        with patch("bot.time.sleep"):
+            self.assertAlmostEqual(self.bot.execute_sell(pos, "stop_loss"), 2.0)
+        self.assertEqual(calls, ["s1", "s2"])
+
+    def test_restart_reconciles_sell_and_accounts_cycle_once(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.bot.j.data["pending_tx"] = {
+            "kind": "sell", "state": "unknown", "mint": self.cand.mint,
+            "signature": "SELLSIG", "pre_token": 1_000_000_000,
+            "pre_usdc": 8_000_000, "expiry_height": 1150,
+            "meta": {
+                "symbol": "TKN", "amount_raw": 1_000_000_000,
+                "usdc_spent": 2.0, "reason": "target", "exit_price": 0.004,
+                "cycle": 1,
+            },
+        }
+        self.bot.j.save()
+        self.rpc.balances[self.cand.mint] = 0
+        self.rpc.balances[self.usdc] = 10_500_000
+        self.rpc.status = self.confirmed
+
+        restarted = CompoundingBot(self.live_cfg(CONFIRM_MAX_WAIT_SEC=0))
+        restarted.rpc = self.rpc
+        result = restarted.reconcile_pending()
+
+        self.assertEqual(result["state"], "confirmed")
+        self.assertEqual(restarted.j.data["cycle"], 1)
+        self.assertIsNone(restarted.j.data["pending_tx"])
+        self.assertIsNone(restarted.j.data["open_position"])
+        self.assertAlmostEqual(restarted.j.realized_pnl_today(), 0.5)
+        self.assertAlmostEqual(restarted.j.data["play_amount_usdc"], 1.5)
+        self.assertEqual(len(restarted.j.data["history"]), 1)
+
+    def test_zero_onchain_balance_keeps_position_blocked_for_manual_review(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 0
+        self.assertIsNone(self.bot.execute_sell(pos, "target"))
+        self.bot.jup.submit_encoded.assert_not_called()
+        self.assertIs(self.bot.j.data["open_position"], pos)
+        self.assertTrue(pos["manual_review"])
+
+    def test_confirmed_sell_with_remaining_tokens_stays_blocked(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 1_000_000_000
+        self.bot.jup.get_quote.return_value = {"outAmount": "3000000"}
+
+        def submit(_signed):
+            self.rpc.balances[self.cand.mint] = 100
+            self.rpc.balances[self.usdc] += 2_000_000
+            self.rpc.status = self.confirmed
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        with patch("bot.time.sleep"):
+            self.assertIsNone(self.bot.execute_sell(pos, "stop_loss"))
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "anomaly")
+        self.assertIs(self.bot.j.data["open_position"], pos)
+        self.assertEqual(self.bot.j.data["cycle"], 0)
+
+    def test_unreadable_balance_blocks_sell(self):
+        pos = self.position()
+        self.rpc.fail_balance = True
+        self.assertIsNone(self.bot.execute_sell(pos, "stop_loss"))
+        self.bot.jup.submit_encoded.assert_not_called()
+
+    def test_kill_switch_still_allows_exit(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        open("KILL_SWITCH", "w").close()
+        self.rpc.balances[self.cand.mint] = 1_000_000_000
+        self.bot.jup.get_quote.return_value = {"outAmount": "3000000"}
+
+        def submit(signed):
+            self.rpc.balances[self.cand.mint] = 0
+            self.rpc.balances[self.usdc] += 3_000_000
+            self.rpc.status = self.confirmed
+            return "x"
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        self.assertAlmostEqual(self.bot.execute_sell(pos, "stop_loss"), 3.0)
+        with self.assertRaises(LiveTradingConfigError):
+            self.bot.execute_buy(1.0, self.cand)
+
+    def test_startup_does_not_require_entry_usdc_to_manage_open_position(self):
+        self.bot.j.data["open_position"] = self.position()
+        self.bot.cfg.MAX_CYCLES = 1
+        self.bot.run_cycle = MagicMock(return_value=True)
+        self.bot.check_balances = MagicMock(return_value=True)
+        self.bot.run()
+        self.bot.check_balances.assert_called_once_with(0.0)
+
+
+class TestCurveRoute(TestLiveTradingGate):
+    """Pump.fun bonding-curve route, wired through the pending-tx pipeline (mocks only)."""
+
+    def setUp(self):
+        super().setUp()
+        from decimal import Decimal
+        self.Decimal = Decimal
+        self.bot = self.live_bot(
+            CONFIRM_MAX_WAIT_SEC=0, CONFIRM_POLL_SEC=0.1, CURVE_TRADING=True)
+        self.rpc = FakeRpc()
+        self.bot.rpc = self.rpc
+        self.cand = make_candidate()
+        self.usdc = self.bot.cfg.INPUT_MINT
+        self.rpc.account = TestChainHelpers._curve_bytes()
+        self.bot.oracle.get_token_decimals = MagicMock(return_value=6)
+        jup = MagicMock()
+        jup.get_quote.return_value = {"outAmount": "150000000"}  # $150 per SOL
+        jup.build_swap_transaction.return_value = "jupraw"
+        jup.sign_transaction.return_value = ("signed", "SIG1")
+        self.bot.jup = jup
+        self.bot.portal = MagicMock()
+        self.bot.portal.build_transaction.return_value = "portalraw"
+        self.confirmed = {"confirmationStatus": "confirmed", "err": None}
+
+    def land_buy(self, *_):
+        self.rpc.balances[self.cand.mint] = 1_000_000_000
+        self.rpc.tx_delta = (-13_500_000, 5000)
+        self.rpc.status = self.confirmed
+        return "SIG1"
+
+    def position(self, **extra):
+        pos = {
+            "buy_tx": "B", "usdc_spent": 2.0, "token_amount": 1000.0,
+            "token_decimals": 6, "token_symbol": "TKN", "entry_price": 0.002,
+            "target_price": 0.004, "stop_price": 0.0016,
+            "token_mint": self.cand.mint, "dex_url": "", "route": "pump",
+        }
+        pos.update(extra)
+        return pos
+
+    def test_curve_route_is_off_by_default(self):
+        self.assertFalse(Config.CURVE_TRADING)
+
+    def test_curve_buy_fills_from_sol_delta_and_keeps_quote_separate(self):
+        self.bot.jup.submit_encoded.side_effect = self.land_buy
+        pos = self.bot.execute_buy(2.0, self.cand)
+        args = self.bot.portal.build_transaction.call_args[0]
+        self.assertEqual(args[1:5], ("buy", self.cand.mint, round(2.0 / 150, 9), True))
+        self.assertEqual(args[7], "pump")
+        self.bot.jup.build_swap_transaction.assert_not_called()
+        self.assertEqual(pos["route"], "pump")
+        self.assertEqual(pos["fill_source"], "onchain")
+        self.assertAlmostEqual(pos["usdc_spent"], 0.0135 * 150)
+        self.assertAlmostEqual(pos["token_amount"], 1000.0)
+        self.assertEqual(pos["fee_lamports"], 5000)
+        self.assertNotAlmostEqual(pos["quoted_token_amount"], pos["token_amount"])
+        self.assertIsNone(self.bot.j.data["pending_tx"])
+
+    def test_curve_buy_journals_pending_with_pre_sol_before_send(self):
+        seen = {}
+
+        def submit(signed):
+            with open("journal.json") as f:
+                seen["p"] = json.load(f)["pending_tx"]
+            return self.land_buy()
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        self.bot.execute_buy(2.0, self.cand)
+        self.assertEqual(seen["p"]["pre_sol"], 1_000_000_000)
+        self.assertEqual(seen["p"]["meta"]["route"], "pump")
+
+    def test_unreadable_curve_state_refuses_buy(self):
+        self.rpc.fail_account = True
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.rpc.fail_account = False
+        self.rpc.account = b"garbage"
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.bot.portal.build_transaction.assert_not_called()
+        self.bot.jup.build_swap_transaction.assert_not_called()
+        self.assertIsNone(self.bot.j.data["pending_tx"])
+
+    def test_unverified_curve_kinds_are_refused(self):
+        usdc_quote = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        for data in (TestChainHelpers._curve_bytes(cashback=1),
+                     TestChainHelpers._curve_bytes(quote=usdc_quote)):
+            self.rpc.account = data
+            self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.bot.portal.build_transaction.assert_not_called()
+        self.bot.jup.build_swap_transaction.assert_not_called()
+
+    def test_graduated_or_missing_curve_uses_jupiter(self):
+        self.bot.jup.get_quote.return_value = {"outAmount": "1000000000"}
+        for account in (TestChainHelpers._curve_bytes(complete=True), None):
+            self.rpc.account = account
+            self.bot.jup.submit_encoded.side_effect = None
+            self.bot.jup.build_swap_transaction.reset_mock()
+            self.rpc.status = None
+            self.bot.execute_buy(2.0, self.cand)
+            self.bot.jup.build_swap_transaction.assert_called_once()
+            self.bot.j.data["pending_tx"] = None
+        self.bot.portal.build_transaction.assert_not_called()
+
+    def test_buy_refused_without_sol_price_or_fee_balance(self):
+        self.bot.jup.get_quote.side_effect = RuntimeError("no quote")
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.bot.jup.get_quote.side_effect = None
+        self.rpc.sol = 5_000_000
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.bot.portal.build_transaction.assert_not_called()
+        self.assertIsNone(self.bot.j.data["pending_tx"])
+
+    def test_buy_stays_pending_until_transaction_metadata_is_available(self):
+        def submit(signed):
+            self.land_buy()
+            self.rpc.fail_tx = True
+            return "SIG1"
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "confirmed")
+        self.assertIsNone(self.bot.j.data.get("open_position"))
+        self.assertFalse(self.bot.run_cycle())
+        # A restarted bot reconciles from the journal once metadata appears.
+        self.rpc.fail_tx = False
+        bot2 = CompoundingBot(self.live_cfg(CURVE_TRADING=True))
+        bot2.rpc = self.rpc
+        self.assertEqual(bot2.reconcile_pending()["state"], "confirmed")
+        self.assertEqual(bot2.j.data["open_position"]["route"], "pump")
+        self.assertIsNone(bot2.j.data["pending_tx"])
+
+    def test_buy_with_no_tokens_or_no_sol_spent_is_an_anomaly(self):
+        for tokens, delta in ((0, (-13_500_000, 5000)), (1_000_000_000, (0, 5000)),
+                              (1_000_000_000, (5_000_000, 5000))):
+            self.bot.j.data["pending_tx"] = None
+            self.rpc.balances[self.cand.mint] = 0
+
+            def submit(signed, tokens=tokens, delta=delta):
+                self.rpc.balances[self.cand.mint] = tokens
+                self.rpc.tx_delta = delta
+                self.rpc.status = self.confirmed
+                return "SIG1"
+
+            self.bot.jup.submit_encoded.side_effect = submit
+            self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+            self.assertEqual(self.bot.j.data["pending_tx"]["state"], "anomaly")
+
+    def test_buy_missing_sol_rate_in_journal_is_an_anomaly(self):
+        self.bot.jup.submit_encoded.side_effect = self.land_buy
+        self.bot.j.save()
+        orig = self.bot._chain_fill
+
+        def broken(p):
+            p["meta"]["sol_usd"] = None
+            return orig(p)
+
+        self.bot._chain_fill = broken
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "anomaly")
+
+    def land_sell(self, delta=(2_990_000_000 // 100, 5000)):
+        def submit(signed):
+            self.rpc.balances[self.cand.mint] = 0
+            self.rpc.tx_delta = delta
+            self.rpc.status = self.confirmed
+            return "SIG1"
+        return submit
+
+    def test_curve_sell_uses_exact_balance_and_books_sol_proceeds(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+        self.bot.jup.submit_encoded.side_effect = self.land_sell((20_000_000, 5000))
+        proceeds = self.bot.execute_sell(pos, "target")
+        self.assertAlmostEqual(proceeds, 3.0)
+        args = self.bot.portal.build_transaction.call_args[0]
+        self.assertEqual(args[1], "sell")
+        self.assertEqual(args[3], self.Decimal("900"))
+        self.assertIs(args[4], False)
+        self.assertIsNone(self.bot.j.data["open_position"])
+        self.assertEqual(self.bot.j.data["cycle"], 1)
+        self.assertAlmostEqual(self.bot.j.realized_pnl_today(), 1.0)
+
+    def test_curve_sell_needs_no_jupiter_sell_quote(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+        self.bot.jup.submit_encoded.side_effect = self.land_sell((20_000_000, 5000))
+        self.bot.execute_sell(pos, "stop_loss")
+        for call in self.bot.jup.get_quote.call_args_list:
+            self.assertEqual(call[0][0], "So11111111111111111111111111111111111111112")
+        self.bot.jup.build_swap_transaction.assert_not_called()
+
+    def test_curve_sell_clamps_negative_net_proceeds_but_closes(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+        self.bot.jup.submit_encoded.side_effect = self.land_sell((-1000, 5000))
+        self.assertEqual(self.bot.execute_sell(pos, "stop_loss"), 0.0)
+        self.assertIsNone(self.bot.j.data["open_position"])
+
+    def test_curve_sell_with_remaining_tokens_is_an_anomaly(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+
+        def submit(signed):
+            self.rpc.balances[self.cand.mint] = 1
+            self.rpc.tx_delta = (20_000_000, 5000)
+            self.rpc.status = self.confirmed
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        self.assertIsNone(self.bot.execute_sell(pos, "target"))
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "anomaly")
+
+    def test_curve_sell_never_resends_when_outcome_unknown(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+        self.rpc.status = None
+        self.assertIsNone(self.bot.execute_sell(pos, "stop_loss"))
+        self.assertEqual(self.bot.portal.build_transaction.call_count, 1)
+        self.assertEqual(self.bot.j.data["pending_tx"]["state"], "unknown")
+
+    def test_curve_sell_retries_only_after_proven_failure(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+        self.rpc.status = {"confirmationStatus": "confirmed", "err": {"InstructionError": 1}}
+        with patch("bot.time.sleep"):
+            self.assertIsNone(self.bot.execute_sell(pos, "stop_loss"))
+        slippages = [c[0][5] for c in self.bot.portal.build_transaction.call_args_list]
+        self.assertEqual(slippages, list(self.bot.cfg.CURVE_SELL_SLIPPAGES_PCT))
+        self.assertIsNotNone(self.bot.j.data["open_position"])
+
+    def test_curve_sell_refused_without_fee_sol_or_sol_price(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+        self.rpc.sol = 1000
+        self.assertIsNone(self.bot.execute_sell(pos, "stop_loss"))
+        self.rpc.sol = 1_000_000_000
+        self.bot.jup.get_quote.side_effect = RuntimeError("no quote")
+        self.assertIsNone(self.bot.execute_sell(pos, "stop_loss"))
+        self.bot.portal.build_transaction.assert_not_called()
+        self.assertIsNone(self.bot.j.data["pending_tx"])
+
+    def test_curve_sell_with_unreadable_curve_state_does_not_sell_blind(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+        self.rpc.fail_account = True
+        self.assertIsNone(self.bot.execute_sell(pos, "stop_loss"))
+        self.bot.portal.build_transaction.assert_not_called()
+        self.bot.jup.build_swap_transaction.assert_not_called()
+
+    def test_graduated_position_exits_through_jupiter_with_usdc_accounting(self):
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+        self.rpc.balances[self.usdc] = 1_000_000
+        self.rpc.account = TestChainHelpers._curve_bytes(complete=True)
+        self.bot.jup.get_quote.return_value = {"outAmount": "3000000"}
+
+        def submit(signed):
+            self.rpc.balances[self.cand.mint] = 0
+            self.rpc.balances[self.usdc] += 2_500_000
+            self.rpc.status = self.confirmed
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        self.assertAlmostEqual(self.bot.execute_sell(pos, "target"), 2.5)
+        self.bot.portal.build_transaction.assert_not_called()
+
+    def test_kill_switch_blocks_curve_buy_but_not_curve_sell(self):
+        open("KILL_SWITCH", "w").close()
+        with self.assertRaises(LiveTradingConfigError):
+            self.bot.execute_buy(2.0, self.cand)
+        pos = self.position()
+        self.bot.j.data["open_position"] = pos
+        self.rpc.balances[self.cand.mint] = 900_000_000
+        self.bot.jup.submit_encoded.side_effect = self.land_sell((20_000_000, 5000))
+        self.assertAlmostEqual(self.bot.execute_sell(pos, "stop_loss"), 3.0)
+
+    def test_journal_rejects_invalid_pre_sol(self):
+        self.bot.j.data["pending_tx"] = {
+            "kind": "buy", "state": "sent", "mint": "m", "signature": "s",
+            "pre_token": 0, "pre_usdc": 0, "pre_sol": -1, "expiry_height": 1, "meta": {},
+        }
+        self.bot.j.save()
+        with self.assertRaisesRegex(JournalCorruptError, "unreadable"):
+            Journal(strict=True)
+
+
+class TestChainHelpers(unittest.TestCase):
+    def test_token_balance_sums_accounts(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"result": {"value": [
+            {"account": {"data": {"parsed": {"info": {"tokenAmount": {"amount": "5"}}}}}},
+            {"account": {"data": {"parsed": {"info": {"tokenAmount": {"amount": "7"}}}}}},
+        ]}}
+        self.assertEqual(RpcClient("http://x", session=session).token_balance("o", "m"), 12)
+
+    def test_rpc_error_raises(self):
+        session = MagicMock()
+        session.post.return_value.json.return_value = {"error": {"code": -1}}
+        with self.assertRaises(RpcError):
+            RpcClient("http://x", session=session).block_height()
+
+    def test_build_transaction_rejects_bad_input(self):
+        client = PumpPortalLocalClient(session=MagicMock())
+        with self.assertRaises(Exception):
+            client.build_transaction("pk", "hold", "mint", 1, True, 5, 0.001)
+
+    def test_build_transaction_uses_documented_pool_values_and_binary_response(self):
+        session = MagicMock()
+        session.post.return_value.status_code = 200
+        session.post.return_value.content = b"unsigned transaction"
+        client = PumpPortalLocalClient(session=session)
+        result = client.build_transaction("pk", "buy", "mint", 0.1, True, 10, 0.001, "launchlab")
+        self.assertEqual(
+            base64.b64decode(result),
+            b"unsigned transaction",
+        )
+        self.assertEqual(session.post.call_args.kwargs["data"]["denominatedInSol"], "true")
+
+    @staticmethod
+    def _curve_bytes(complete=False, quote=None, vtok=1_000_000_000_000,
+                     vquote=30_000_000_000, disc=None, cashback=0):
+        import struct
+        from solders.pubkey import Pubkey
+        from chain import BONDING_CURVE_DISCRIMINATOR, WSOL_MINT
+        return struct.pack(
+            "<8s5QB32sBB32s",
+            disc or BONDING_CURVE_DISCRIMINATOR, vtok, vquote, 5, 6, 7,
+            complete, bytes(32), 0, cashback,
+            bytes(Pubkey.from_string(quote or WSOL_MINT)),
+        ) + bytes(40)
+
+    def test_parse_bonding_curve_idl_layout(self):
+        from chain import curve_price_sol
+        curve = parse_bonding_curve(self._curve_bytes())
+        self.assertFalse(curve["complete"])
+        self.assertEqual(curve["real_quote_reserves"], 6)
+        self.assertEqual(curve["quote_mint"], "So11111111111111111111111111111111111111112")
+        self.assertAlmostEqual(curve_price_sol(curve, 6), 30.0 / 1_000_000.0)
+
+    def test_parse_bonding_curve_fails_closed(self):
+        from chain import curve_price_sol
+        with self.assertRaises(ValueError):
+            parse_bonding_curve(self._curve_bytes(disc=bytes(8)))
+        with self.assertRaises(ValueError):
+            parse_bonding_curve(b"short")
+        with self.assertRaises(ValueError):
+            parse_bonding_curve(self._curve_bytes(vtok=0))
+        with self.assertRaises(ValueError):
+            curve_price_sol(parse_bonding_curve(self._curve_bytes(complete=True)))
+        usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        with self.assertRaises(ValueError):
+            curve_price_sol(parse_bonding_curve(self._curve_bytes(quote=usdc)))
+
+    def _rpc_with(self, payload):
+        session = MagicMock()
+        session.post.return_value.status_code = 200
+        session.post.return_value.json.return_value = {"result": payload}
+        return RpcClient("http://rpc.invalid", session=session)
+
+    def test_transaction_sol_delta(self):
+        tx = {"meta": {"err": None, "fee": 5000, "preBalances": [10_000, 1],
+                       "postBalances": [4_000, 1]},
+              "transaction": {"message": {"accountKeys": ["owner", "other"]}}}
+        self.assertEqual(self._rpc_with(tx).transaction_sol_delta("sig", "owner"),
+                         (-6_000, 5000))
+        self.assertIsNone(self._rpc_with(None).transaction_sol_delta("sig", "owner"))
+
+    def test_transaction_sol_delta_rejects_bad_metadata(self):
+        base = {"meta": {"err": None, "fee": 5000, "preBalances": [10_000],
+                         "postBalances": [4_000]},
+                "transaction": {"message": {"accountKeys": ["owner"]}}}
+        cases = []
+        cases.append({**base, "meta": {**base["meta"], "err": {"x": 1}}})
+        cases.append({**base, "meta": {**base["meta"], "postBalances": []}})
+        cases.append({**base, "meta": {k: v for k, v in base["meta"].items() if k != "fee"}})
+        cases.append(base)  # owner not in keys is tested below via a different owner
+        for tx in cases[:3]:
+            with self.assertRaises(RpcError):
+                self._rpc_with(tx).transaction_sol_delta("sig", "owner")
+        with self.assertRaises(RpcError):
+            self._rpc_with(base).transaction_sol_delta("sig", "stranger")
+
+    def test_account_data_decodes_and_handles_missing(self):
+        raw = b"\x01\x02\x03"
+        payload = {"value": {"data": [base64.b64encode(raw).decode(), "base64"]}}
+        self.assertEqual(self._rpc_with(payload).account_data("a"), raw)
+        self.assertIsNone(self._rpc_with({"value": None}).account_data("a"))
+        with self.assertRaises(RpcError):
+            self._rpc_with({"value": {"data": ["!!not-base64!!", "base64"]}}).account_data("a")
+
+    def test_build_transaction_sends_exact_decimal_amount(self):
+        from decimal import Decimal
+        session = MagicMock()
+        session.post.return_value.status_code = 200
+        session.post.return_value.content = b"tx"
+        client = PumpPortalLocalClient(session=session)
+        client.build_transaction("pk", "sell", "mint", Decimal("900.123456"), False, 15, 0.0001)
+        self.assertEqual(session.post.call_args.kwargs["data"]["amount"], "900.123456")
+        self.assertEqual(session.post.call_args.kwargs["data"]["denominatedInSol"], "false")
+
+    def test_sol_balance_validates(self):
+        self.assertEqual(self._rpc_with({"value": 42}).sol_balance("o"), 42)
+        for bad in ({"value": -1}, {"value": True}, {"value": "1"}, None):
+            with self.assertRaises(RpcError):
+                self._rpc_with(bad).sol_balance("o")
+
+
 if __name__ == "__main__":
     unittest.main()
-
-

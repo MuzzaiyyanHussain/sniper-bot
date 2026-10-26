@@ -44,7 +44,7 @@ def parse_sol_amount(event: dict, max_reasonable_sol: float = 1_000.0) -> float 
 @dataclass
 class ScannerConfig:
     # Age window — with WebSocket we catch tokens in seconds
-    max_age_minutes:      int   = 5        # skip if >3 min (already pumped)
+    max_age_minutes:      int   = 2        # reject candidates older than 2 minutes
     min_age_minutes:      int   = 0         # no minimum — catch at birth
 
     # Liquidity — pump.fun pools start very small
@@ -960,7 +960,7 @@ class TokenScanner:
         return [candidate] if candidate else []
 
 
-# ════════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════do═════════════════════════════════════════
 # HELPERS
 # ════════════════════════════════════════════════════════════════════════════════
 def _log_token(t: TokenCandidate):

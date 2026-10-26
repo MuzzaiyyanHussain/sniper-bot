@@ -14,6 +14,7 @@ import time
 import json
 import csv
 import base64
+import shutil
 import logging
 import requests
 import base58
@@ -24,6 +25,10 @@ from dotenv import load_dotenv
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
 from token_scanner import TokenScanner, ScannerConfig, TokenCandidate, DexScreenerClient
+from chain import (
+    RpcClient, RpcError, PumpPortalLocalClient, WSOL_MINT,
+    bonding_curve_address, parse_bonding_curve,
+)
 
 load_dotenv()
 logging.basicConfig(
@@ -88,6 +93,29 @@ class Config:
     JUPITER_SWAP_URL:      str   = "https://api.jup.ag/swap/v1/swap"
     DRY_RUN:               bool  = parse_bool_env(os.getenv("DRY_RUN", "true"))
 
+    # ── Live-trading safety gate (only consulted when DRY_RUN is false) ───────
+    # Kept as raw strings so a bad value is reported by validate_live_config()
+    # instead of crashing at import time.
+    LIVE_TRADING_CONFIRM:  str   = os.getenv("LIVE_TRADING_CONFIRM", "")
+    MAX_POSITION_USDC:     str   = os.getenv("MAX_POSITION_USDC", "")
+    MAX_DAILY_LOSS_USDC:   str   = os.getenv("MAX_DAILY_LOSS_USDC", "")
+    KILL_SWITCH_FILE:      str   = os.getenv("KILL_SWITCH_FILE", "KILL_SWITCH")
+
+    # ── Pump.fun bonding-curve route (live only; off unless explicitly enabled)
+    CURVE_TRADING:         bool  = parse_bool_env(os.getenv("CURVE_TRADING", "false"), "CURVE_TRADING")
+    CURVE_BUY_SLIPPAGE_PCT: float = float(os.getenv("CURVE_BUY_SLIPPAGE_PCT", "15"))
+    CURVE_SELL_SLIPPAGES_PCT: tuple = (15.0, 30.0, 50.0)
+    CURVE_PRIORITY_FEE_SOL: float = float(os.getenv("CURVE_PRIORITY_FEE_SOL", "0.0001"))
+    MIN_SOL_FOR_FEES:      float = float(os.getenv("MIN_SOL_FOR_FEES", "0.01"))
+    MIN_SOL_FOR_SELL:      float = float(os.getenv("MIN_SOL_FOR_SELL", "0.003"))
+
+    # ── Transaction settlement ────────────────────────────────────────────────
+    # A blockhash is valid for ~150 blocks; a signature with no status is only
+    # declared failed after the chain passes that window (never before).
+    BLOCKHASH_VALIDITY_BLOCKS: int = 150
+    CONFIRM_POLL_SEC:      float = float(os.getenv("CONFIRM_POLL_SEC", "2"))
+    CONFIRM_MAX_WAIT_SEC:  float = float(os.getenv("CONFIRM_MAX_WAIT_SEC", "90"))
+
     # ── Liquidity / dead-pool handling ────────────────────────────────────────
     # Below this, a pool is considered unsellable (no real market depth) —
     # we stop hammering Jupiter for quotes and alert instead of retrying.
@@ -98,6 +126,76 @@ class Config:
     # If no usable price is seen for this long while holding a position, give
     # up waiting and attempt an exit instead of polling forever. 0 disables.
     MAX_NO_PRICE_SEC:           int   = int(os.getenv("MAX_NO_PRICE_SEC", "120"))
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# LIVE-TRADING SAFETY GATE
+# ════════════════════════════════════════════════════════════════════════════════
+LIVE_CONFIRM_PHRASE = "I UNDERSTAND THIS USES REAL MONEY AND I CAN LOSE ALL OF IT"
+# Upper sanity bounds for operator-supplied limits. A larger value is treated
+# as a likely typo and rejected rather than silently accepted.
+LIVE_MAX_POSITION_CEILING_USDC = 100.0
+LIVE_MAX_DAILY_LOSS_CEILING_USDC = 500.0
+
+
+class LiveTradingConfigError(RuntimeError):
+    """Live trading was requested without valid, complete safeguards."""
+
+
+class JournalCorruptError(RuntimeError):
+    """The journal could not be read and live mode refuses to guess state."""
+
+
+def _parse_limit(value, name: str, ceiling: float, problems: list) -> float | None:
+    if value is None or isinstance(value, bool) or str(value).strip() == "":
+        problems.append(f"{name} is required for live trading")
+        return None
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        problems.append(f"{name} is not a valid number")
+        return None
+    if not math.isfinite(number) or number <= 0:
+        problems.append(f"{name} must be a finite number greater than 0")
+        return None
+    if number > ceiling:
+        problems.append(f"{name} exceeds the safety ceiling of {ceiling:g} USDC")
+        return None
+    return number
+
+
+def validate_live_config(cfg: Config) -> None:
+    """Fail closed unless every live-trading safeguard is present and valid.
+
+    A no-op in dry-run. Messages never include the wallet key or the entered
+    confirmation text.
+    """
+    if cfg.DRY_RUN:
+        return
+    problems: list = []
+    if (cfg.LIVE_TRADING_CONFIRM or "") != LIVE_CONFIRM_PHRASE:
+        problems.append("LIVE_TRADING_CONFIRM does not exactly match the required phrase")
+    max_position = _parse_limit(
+        cfg.MAX_POSITION_USDC, "MAX_POSITION_USDC",
+        LIVE_MAX_POSITION_CEILING_USDC, problems)
+    _parse_limit(
+        cfg.MAX_DAILY_LOSS_USDC, "MAX_DAILY_LOSS_USDC",
+        LIVE_MAX_DAILY_LOSS_CEILING_USDC, problems)
+    if not str(cfg.KILL_SWITCH_FILE or "").strip():
+        problems.append("KILL_SWITCH_FILE must be set")
+    if not cfg.WALLET_PRIVATE_KEY:
+        problems.append("WALLET_PRIVATE_KEY is required for live trading")
+    if max_position is not None and cfg.STARTING_AMOUNT_USDC > max_position:
+        problems.append("STARTING_AMOUNT_USDC exceeds MAX_POSITION_USDC")
+    if problems:
+        raise LiveTradingConfigError(
+            "Live trading refused: " + "; ".join(problems))
+
+
+def kill_switch_active(cfg: Config) -> bool:
+    """True when the kill-switch file exists. A missing path setting counts as active."""
+    path = str(cfg.KILL_SWITCH_FILE or "").strip()
+    return True if not path else os.path.exists(path)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -197,6 +295,35 @@ class JupiterClient:
         resp = self.session.post(self.cfg.JUPITER_SWAP_URL, json=payload, timeout=15)
         resp.raise_for_status()
         return resp.json()["swapTransaction"]
+
+    def sign_transaction(self, raw_tx_b64: str, keypair: Keypair) -> tuple:
+        """Sign locally; returns (signed_b64, signature). Never touches the network.
+
+        The signature is known before sending, so it can be journaled first.
+        """
+        if self.cfg.DRY_RUN:
+            raise RuntimeError("Safety block: signing is disabled while DRY_RUN is enabled")
+        tx = VersionedTransaction.from_bytes(base64.b64decode(raw_tx_b64))
+        signed_tx = VersionedTransaction(tx.message, [keypair])
+        encoded = base64.b64encode(bytes(signed_tx)).decode("utf-8")
+        return encoded, str(signed_tx.signatures[0])
+
+    def submit_encoded(self, encoded: str) -> str:
+        """Broadcast an already-signed transaction (blocked in dry-run)."""
+        if self.cfg.DRY_RUN:
+            raise RuntimeError("Safety block: sending is disabled while DRY_RUN is enabled")
+        payload = {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "sendTransaction",
+            "params": [encoded, {"encoding": "base64", "skipPreflight": True,
+                                  "preflightCommitment": "confirmed", "maxRetries": 3}],
+        }
+        resp = requests.post(self.cfg.SOLANA_RPC_URL, json=payload, timeout=30)
+        resp.raise_for_status()
+        result = resp.json()
+        if "error" in result:
+            raise RuntimeError(f"RPC error: {result['error']}")
+        return result["result"]
 
     def sign_and_send(self, raw_tx_b64: str, keypair: Keypair) -> str:
         """Deserialize, sign, and broadcast transaction unless dry-run is active."""
@@ -381,7 +508,10 @@ class Journal:
         "total_winnings", "win", "reason", "exit_price", "dex_url",
     ]
 
-    def __init__(self):
+    def __init__(self, strict: bool = False):
+        # strict (live mode): never auto-recover from a corrupt journal, since a
+        # stale backup could hide an open position or pending transaction.
+        self.strict = strict
         self.data = self._load()
         self._init_csv()
 
@@ -413,26 +543,135 @@ class Journal:
                 row.get("dex_url", ""),
             ])
 
-    def _load(self) -> dict:
-        if os.path.exists(self.FILE):
-            with open(self.FILE, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            if "consec_losses" not in data:
-                data["consec_losses"] = 0
-            return data
+    @staticmethod
+    def _fresh_state() -> dict:
         return {
             "cycle": 0,
             "play_amount_usdc": None,
             "total_saved_usdc": 0.0,
             "total_winnings_usdc": 0.0,
             "open_position": None,
+            "pending_tx": None,
             "consec_losses": 0,
             "history": [],
         }
 
+    def _read_file(self, path: str) -> dict:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError("journal root must be an object")
+        for key, value in self._fresh_state().items():
+            data.setdefault(key, value)
+        data.setdefault("consec_losses", 0)
+        if isinstance(data["cycle"], bool) or not isinstance(data["cycle"], int) or data["cycle"] < 0:
+            raise ValueError("journal cycle is invalid")
+        for key in ("total_saved_usdc", "total_winnings_usdc"):
+            value = data[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                raise ValueError(f"journal {key} is invalid")
+        play_amount = data["play_amount_usdc"]
+        if play_amount is not None and (
+            isinstance(play_amount, bool)
+            or not isinstance(play_amount, (int, float))
+            or not math.isfinite(play_amount)
+            or play_amount < 0
+        ):
+            raise ValueError("journal play_amount_usdc is invalid")
+        position = data["open_position"]
+        if position is not None and (
+            not isinstance(position, dict)
+            or not isinstance(position.get("token_mint"), str)
+            or not position.get("token_mint")
+            or isinstance(position.get("token_amount"), bool)
+            or not isinstance(position.get("token_amount"), (int, float))
+            or not math.isfinite(position["token_amount"])
+            or position["token_amount"] <= 0
+            or isinstance(position.get("usdc_spent"), bool)
+            or not isinstance(position.get("usdc_spent"), (int, float))
+            or not math.isfinite(position["usdc_spent"])
+            or position["usdc_spent"] < 0
+        ):
+            raise ValueError("journal open_position is invalid")
+        pending = data["pending_tx"]
+        if pending is not None:
+            if (
+                not isinstance(pending, dict)
+                or pending.get("kind") not in {"buy", "sell"}
+                or pending.get("state") not in {"sent", "unknown", "confirmed", "anomaly"}
+                or not isinstance(pending.get("mint"), str)
+                or not pending.get("mint")
+                or not isinstance(pending.get("signature"), str)
+                or not pending.get("signature")
+                or not isinstance(pending.get("meta"), dict)
+            ):
+                raise ValueError("journal pending_tx is invalid")
+            for key in ("pre_token", "pre_usdc", "expiry_height"):
+                value = pending.get(key)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"journal pending_tx {key} is invalid")
+            if "pre_sol" in pending:
+                value = pending["pre_sol"]
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError("journal pending_tx pre_sol is invalid")
+        return data
+
+    def _load(self) -> dict:
+        if not os.path.exists(self.FILE):
+            if self.strict:
+                raise JournalCorruptError(
+                    f"{self.FILE} is missing. Live mode will not start with an empty "
+                    "journal because that could hide an existing position or transaction. "
+                    "Initialize and verify the journal in dry-run."
+                )
+            return self._fresh_state()
+        try:
+            return self._read_file(self.FILE)
+        except (OSError, ValueError) as exc:
+            if self.strict:
+                raise JournalCorruptError(
+                    f"{self.FILE} is unreadable ({type(exc).__name__}). Live mode will "
+                    f"not auto-recover: inspect the file and {self.FILE}.bak, then "
+                    f"repair or remove it deliberately."
+                ) from exc
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            quarantined = f"{self.FILE}.corrupt-{stamp}"
+            os.replace(self.FILE, quarantined)
+            log.error("Journal unreadable; moved to %s", quarantined)
+            try:
+                data = self._read_file(self.FILE + ".bak")
+                log.warning("Recovered journal from %s.bak", self.FILE)
+                return data
+            except (OSError, ValueError):
+                log.warning("No usable journal backup; starting a fresh dry-run journal")
+                return self._fresh_state()
+
     def save(self):
-        with open(self.FILE, "w") as f:
+        """Write-and-replace so a crash never leaves a half-written journal."""
+        tmp = self.FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(self.FILE):
+            shutil.copyfile(self.FILE, self.FILE + ".bak")
+        os.replace(tmp, self.FILE)
+
+    @staticmethod
+    def _today() -> str:
+        return datetime.now().astimezone().date().isoformat()
+
+    def realized_pnl_today(self) -> float:
+        daily = self.data.get("daily_pnl") or {}
+        if daily.get("date") != self._today():
+            return 0.0
+        return float(daily.get("pnl_usdc", 0.0))
+
+    def record_pnl(self, pnl_usdc: float):
+        self.data["daily_pnl"] = {
+            "date": self._today(),
+            "pnl_usdc": self.realized_pnl_today() + pnl_usdc,
+        }
 
     def log_cycle(self, cycle_data: dict):
         ts = datetime.now().astimezone().isoformat()
@@ -447,10 +686,13 @@ class Journal:
 class CompoundingBot:
     def __init__(self, cfg: Config):
         self.cfg    = cfg
+        validate_live_config(cfg)
         self.calc   = StrategyCalc(cfg)
         self.jup    = JupiterClient(cfg)
         self.oracle = PriceOracle(cfg)
-        self.j      = Journal()
+        self.j      = Journal(strict=not cfg.DRY_RUN)
+        self.rpc    = RpcClient(cfg.SOLANA_RPC_URL)
+        self.portal = PumpPortalLocalClient()
         self.scanner = TokenScanner(ScannerConfig(), birdeye_api_key=os.getenv("BIRDEYE_API_KEY", ""))
 
         if self.cfg.DRY_RUN:
@@ -539,14 +781,416 @@ class CompoundingBot:
             log.warning(f"⚠️  Low SOL ({sol:.4f}). Recommend topping up.")
         return True
 
+    # ── Transaction state, settlement and reconciliation ─────────────────────
+    # pending_tx lifecycle (live only; at most one at a time):
+    #   sent  → confirmed → (finalized into open_position / closed position)
+    #   sent  → cleared on proven failure (on-chain error, or blockhash expired
+    #           with no status)
+    #   sent  → unknown on RPC failure/timeout: blocks ALL new trades and any
+    #           re-send until a later reconcile proves the outcome.
+    #   confirmed/unknown → anomaly if on-chain balances contradict the trade.
+    # The signature is journaled BEFORE the send, so a crash at any point
+    # leaves enough information to determine what happened from the chain.
+    def _clear_pending(self, why: str):
+        p = self.j.data.get("pending_tx") or {}
+        log.warning("Pending %s tx cleared (%s): %s", p.get("kind"), why, str(p.get("signature"))[:20])
+        self.j.data["pending_tx"] = None
+        self.j.save()
+
+    def _settle_pending(self, wait_sec: float | None = None) -> str:
+        """Return 'confirmed' | 'failed' | 'unknown' | 'none' using chain data only."""
+        p = self.j.data.get("pending_tx")
+        if not p:
+            return "none"
+        if p.get("state") == "confirmed":
+            return "confirmed"
+        sig = p.get("signature")
+        if not sig:
+            self._clear_pending("never sent")
+            return "failed"
+        wait = self.cfg.CONFIRM_MAX_WAIT_SEC if wait_sec is None else wait_sec
+        polls = max(1, int(wait // max(self.cfg.CONFIRM_POLL_SEC, 0.1)) + 1)
+        try:
+            for i in range(polls):
+                status = self.rpc.signature_status(sig)
+                if status is None and self.rpc.block_height() > p["expiry_height"]:
+                    # Blockhash window is over; one final look closes the race
+                    # where the transaction landed just before expiry.
+                    status = self.rpc.signature_status(sig)
+                    if status is None:
+                        self._clear_pending("blockhash expired, transaction never landed")
+                        return "failed"
+                if status is not None:
+                    confirmation = status.get("confirmationStatus")
+                    terminal = (
+                        confirmation in ("confirmed", "finalized")
+                        or ("confirmations" in status and status["confirmations"] is None)
+                    )
+                    if status.get("err") and terminal:
+                        self._clear_pending(f"failed on-chain: {status['err']}")
+                        return "failed"
+                    if terminal and not status.get("err"):
+                        p["state"] = "confirmed"
+                        self.j.save()
+                        return "confirmed"
+                if i < polls - 1:
+                    time.sleep(self.cfg.CONFIRM_POLL_SEC)
+        except RpcError as exc:
+            log.error("RPC error while settling %s: %s", sig[:20], exc)
+        p["state"] = "unknown"
+        self.j.save()
+        log.error(
+            "Transaction %s is unresolved. New trades and re-sends are blocked "
+            "until it is reconciled. Check https://solscan.io/tx/%s", sig[:20], sig
+        )
+        return "unknown"
+
+    def _submit_and_settle(self, kind: str, mint: str, raw_tx_b64: str, meta: dict) -> str:
+        """Sign, journal, send and settle one transaction. Never re-sends.
+
+        Returns 'confirmed' | 'failed' | 'unknown' | 'aborted'. 'aborted' means
+        nothing was signed or sent.
+        """
+        if self.j.data.get("pending_tx"):
+            log.error("Refusing to send: an earlier transaction is unresolved")
+            return "aborted"
+        try:
+            pre_token = self.rpc.token_balance(self.pubkey, mint)
+            pre_usdc = self.rpc.token_balance(self.pubkey, self.cfg.INPUT_MINT)
+            pre_sol = self.rpc.sol_balance(self.pubkey) if meta.get("route") == "pump" else None
+            height = self.rpc.block_height()
+        except RpcError as exc:
+            log.error("Cannot read pre-trade balances (%s); not sending", exc)
+            return "aborted"
+        try:
+            signed, sig = self.jup.sign_transaction(raw_tx_b64, self.keypair)
+        except Exception as exc:
+            log.error("Signing failed (%s); not sending", type(exc).__name__)
+            return "aborted"
+        self.j.data["pending_tx"] = {
+            "kind": kind, "state": "sent", "mint": mint, "signature": sig,
+            "pre_token": pre_token, "pre_usdc": pre_usdc,
+            "expiry_height": height + self.cfg.BLOCKHASH_VALIDITY_BLOCKS,
+            "created_at": datetime.now().astimezone().isoformat(),
+            "meta": meta,
+        }
+        if pre_sol is not None:
+            self.j.data["pending_tx"]["pre_sol"] = pre_sol
+        self.j.save()
+        try:
+            self.jup.submit_encoded(signed)
+        except Exception as exc:
+            # Even an RPC error response may be a duplicate/already-processed
+            # signature or a lost response after acceptance. Resolve by signature;
+            # never discard the durable pending record based on the send exception.
+            log.warning("Send result ambiguous (%s); settling by signature", type(exc).__name__)
+        log.info("   TX: https://solscan.io/tx/%s", sig)
+        return self._settle_pending()
+
+    def _chain_fill(self, p: dict):
+        """Confirmed fill from chain data: (post_token, quote_delta_usd, extras).
+
+        quote_delta_usd is the signed change in the wallet's quote asset in USD
+        terms (USDC delta for Jupiter, SOL delta incl. fees for the curve route).
+        Returns None when data is unavailable (caller retries on reconcile) and
+        raises ValueError when the data is present but unusable (anomaly).
+        """
+        meta = p["meta"]
+        post_token = self.rpc.token_balance(self.pubkey, p["mint"])
+        if meta.get("route") != "pump":
+            post_usdc = self.rpc.token_balance(self.pubkey, self.cfg.INPUT_MINT)
+            return post_token, (post_usdc - p["pre_usdc"]) / (10 ** USDC_DECIMALS), {}
+        sol_usd = meta.get("sol_usd")
+        if (isinstance(sol_usd, bool) or not isinstance(sol_usd, (int, float))
+                or not math.isfinite(sol_usd) or sol_usd <= 0):
+            raise ValueError("missing SOL/USD rate for a SOL-denominated trade")
+        res = self.rpc.transaction_sol_delta(p["signature"], self.pubkey)
+        if res is None:
+            raise RpcError("confirmed transaction not yet retrievable")
+        sol_delta, fee = res
+        return post_token, (sol_delta / 1e9) * sol_usd, {
+            "sol_delta_lamports": sol_delta, "fee_lamports": fee, "sol_usd": sol_usd,
+        }
+
+    def _finalize_buy(self) -> dict | None:
+        """Turn a confirmed buy into an open position from on-chain balance deltas."""
+        p = self.j.data.get("pending_tx")
+        if not p or p.get("kind") != "buy" or p.get("state") != "confirmed":
+            return None
+        meta = p["meta"]
+        try:
+            post_token, quote_delta, extras = self._chain_fill(p)
+        except RpcError as exc:
+            log.error("Buy confirmed but chain data unavailable (%s); will retry on reconcile", exc)
+            return None
+        except ValueError as exc:
+            p["state"] = "anomaly"
+            self.j.save()
+            log.error("Buy confirmed but fill is unusable (%s). Manual review required.", exc)
+            return None
+        delta = post_token - p["pre_token"]
+        usdc_spent = -quote_delta
+        if delta <= 0 or usdc_spent <= 0:
+            p["state"] = "anomaly"
+            self.j.save()
+            log.error("Buy confirmed but balances do not match (token Δ=%s, quote Δ=%s). "
+                      "Manual review required; trading blocked.", delta, quote_delta)
+            return None
+        decimals = meta["token_decimals"]
+        token_amount = delta / (10 ** decimals)
+        entry_price = usdc_spent / token_amount
+        position = {
+            "buy_tx": p["signature"],
+            "usdc_spent": usdc_spent,
+            "token_amount": token_amount,
+            "token_decimals": decimals,
+            "token_symbol": meta["symbol"],
+            "entry_price": entry_price,
+            "target_price": entry_price * self.cfg.PRICE_TARGET_MULT,
+            "stop_price": entry_price * self.cfg.STOP_LOSS_MULT if self.cfg.STOP_LOSS_MULT > 0 else 0,
+            "token_mint": p["mint"],
+            "dex_url": meta.get("dex_url", ""),
+            "fill_source": "onchain",
+            "quoted_token_amount": meta.get("quoted_token_amount"),
+            "quoted_entry_price": meta.get("quoted_entry_price"),
+        }
+        if meta.get("route") == "pump":
+            position.update({"route": "pump", **extras})
+        self.j.data["open_position"] = position
+        self.j.data["pending_tx"] = None
+        self.j.save()
+        log.info("   Filled: %.6f %s for $%.4f (on-chain)", token_amount, meta["symbol"], usdc_spent)
+        return position
+
+    def _finalize_sell(self) -> float | None:
+        """Close the position from on-chain deltas; returns actual USDC received."""
+        p = self.j.data.get("pending_tx")
+        if not p or p.get("kind") != "sell" or p.get("state") != "confirmed":
+            return None
+        try:
+            post_token, quote_delta, _extras = self._chain_fill(p)
+        except RpcError as exc:
+            log.error("Sell confirmed but chain data unavailable (%s); will retry on reconcile", exc)
+            return None
+        except ValueError as exc:
+            p["state"] = "anomaly"
+            self.j.save()
+            log.error("Sell confirmed but fill is unusable (%s). Manual review required.", exc)
+            return None
+        sold_raw = p["pre_token"] - post_token
+        is_curve = p["meta"].get("route") == "pump"
+        # A curve sell's SOL delta is net of fees, so a tiny sale can be slightly
+        # negative; clamp it. A negative USDC delta is never legitimate.
+        if quote_delta < 0 and is_curve:
+            quote_delta = 0.0
+        if sold_raw < p["meta"]["amount_raw"] or quote_delta < 0 or post_token != 0:
+            p["state"] = "anomaly"
+            self.j.save()
+            log.error(
+                "Sell confirmed but balances do not match (token Δ=%s, remaining=%s, "
+                "quote Δ=%s). Manual review required; trading blocked.",
+                sold_raw, post_token, quote_delta,
+            )
+            return None
+
+        position = self.j.data.get("open_position") or {}
+        meta = p["meta"]
+        proceeds = quote_delta
+        spent = float(position.get("usdc_spent", meta.get("usdc_spent", 0.0)))
+        reason = meta.get("reason", "recovered_sell")
+        cycle = meta.get("cycle", self.j.data["cycle"] + 1)
+        exit_price = meta.get("exit_price", 0.0)
+        win = reason == "target"
+        next_play = proceeds * self.cfg.REINVEST_PCT if win else proceeds
+        saved = proceeds * self.cfg.SAVE_PCT if win else 0.0
+
+        self.j.data["cycle"] = cycle
+        self.j.data["play_amount_usdc"] = next_play
+        self.j.data["total_saved_usdc"] += saved
+        self.j.data["total_winnings_usdc"] += proceeds
+        self.j.data["consec_losses"] = (
+            0 if win else self.j.data.get("consec_losses", 0) + 1
+        )
+        self.j.record_pnl(proceeds - spent)
+        self.j.data["open_position"] = None
+        self.j.data["pending_tx"] = None
+        self.j.log_cycle({
+            "cycle": cycle,
+            "token": position.get("token_symbol", meta.get("symbol", "?")),
+            "token_mint": position.get("token_mint", p["mint"]),
+            "dex_url": position.get("dex_url", ""),
+            "play_amount": spent,
+            "winnings": proceeds,
+            "next_play": next_play,
+            "saved": saved,
+            "total_saved": self.j.data["total_saved_usdc"],
+            "total_winnings": self.j.data["total_winnings_usdc"],
+            "win": win,
+            "reason": reason,
+            "exit_price": exit_price,
+        })
+        log.info("   Sell accounted from confirmed balance deltas.")
+        return proceeds
+
+    def reconcile_pending(self) -> dict:
+        """Resolve any journaled transaction from chain data. Safe to call anytime.
+        """
+        p = self.j.data.get("pending_tx")
+        if not p:
+            return {"state": "none"}
+        if p.get("state") == "anomaly":
+            log.error("Pending transaction is flagged for manual review; trading blocked.")
+            return {"state": "anomaly"}
+        kind = p["kind"]
+        outcome = self._settle_pending()
+        if outcome != "confirmed":
+            return {"state": outcome, "kind": kind}
+        if kind == "buy":
+            return {"state": "confirmed" if self._finalize_buy() else "unresolved", "kind": kind}
+        proceeds = self._finalize_sell()
+        if proceeds is None:
+            return {"state": "unresolved", "kind": kind}
+        return {"state": "confirmed", "kind": kind, "proceeds": proceeds}
+
+    # ── Pump.fun bonding-curve route ──────────────────────────────────────────
+    def _sol_usd(self) -> float:
+        """SOL/USD from a live Jupiter SOL→USDC quote. Raises if unusable."""
+        quote = self.jup.get_quote(WSOL_MINT, self.cfg.INPUT_MINT, 10 ** 9)
+        price = int(quote["outAmount"]) / (10 ** USDC_DECIMALS)
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError("SOL/USD quote is unusable")
+        return price
+
+    def _curve_state(self, mint: str) -> dict | None:
+        """Parsed curve, or None when no curve account exists.
+
+        Raises RpcError/ValueError when the state cannot be trusted."""
+        data = self.rpc.account_data(bonding_curve_address(mint))
+        return None if data is None else parse_bonding_curve(data)
+
+    def _curve_buy(self, usdc_amount: float, token: TokenCandidate, curve: dict) -> dict | None:
+        try:
+            sol_usd = self._sol_usd()
+            sol_lamports = self.rpc.sol_balance(self.pubkey)
+            token_decimals = self.oracle.get_token_decimals(token.mint)
+        except Exception as exc:
+            log.error("Curve buy refused: cannot establish SOL price/balance (%s)", exc)
+            return None
+        sol_amount = round(usdc_amount / sol_usd, 9)
+        if sol_amount <= 0 or sol_lamports / 1e9 < sol_amount + self.cfg.MIN_SOL_FOR_FEES:
+            log.error("Curve buy refused: SOL balance cannot cover %.6f SOL plus fees", sol_amount)
+            return None
+        vtok, vquote = curve["virtual_token_reserves"], curve["virtual_quote_reserves"]
+        in_lam = int(sol_amount * 1e9)
+        est_tokens = (vtok - (vtok * vquote) // (vquote + in_lam)) / (10 ** token_decimals)
+        if est_tokens <= 0:
+            log.error("Curve buy refused: estimated output is zero")
+            return None
+        log.info("   Curve route: %.6f SOL (~$%.4f at $%.2f/SOL), est. %.6f %s before fees",
+                 sol_amount, usdc_amount, sol_usd, est_tokens, token.symbol)
+        try:
+            raw_tx = self.portal.build_transaction(
+                self.pubkey, "buy", token.mint, sol_amount, True,
+                self.cfg.CURVE_BUY_SLIPPAGE_PCT, self.cfg.CURVE_PRIORITY_FEE_SOL, "pump")
+        except Exception as exc:
+            log.error("Could not build curve buy (%s); nothing sent", type(exc).__name__)
+            return None
+        outcome = self._submit_and_settle("buy", token.mint, raw_tx, {
+            "route": "pump", "sol_usd": sol_usd, "sol_amount": sol_amount,
+            "symbol": token.symbol, "dex_url": token.url,
+            "token_decimals": token_decimals, "usdc_amount": usdc_amount,
+            "quoted_token_amount": est_tokens,
+            "quoted_entry_price": usdc_amount / est_tokens,
+        })
+        if outcome != "confirmed":
+            log.error("Curve buy not confirmed (%s) — no position opened.", outcome)
+            return None
+        return self._finalize_buy()
+
+    def _curve_sell(self, position: dict, reason: str, exit_price: float,
+                    cycle: int | None, amount_raw: int, decimals: int) -> float | None:
+        mint = position["token_mint"]
+        for attempt, slippage in enumerate(self.cfg.CURVE_SELL_SLIPPAGES_PCT, 1):
+            state, value = self._prepare_live_sell(position, amount_raw)
+            if state == "sold":
+                return value
+            if state == "blocked":
+                return None
+            amount_raw = value
+            try:
+                sol_usd = self._sol_usd()
+                sol_lamports = self.rpc.sol_balance(self.pubkey)
+            except Exception as exc:
+                log.error("Curve sell refused: cannot establish SOL price/balance (%s)", exc)
+                return None
+            if sol_lamports / 1e9 < self.cfg.MIN_SOL_FOR_SELL:
+                log.error("Curve sell refused: not enough SOL to pay fees. Top up the wallet.")
+                return None
+            ui_amount = Decimal(amount_raw) / (Decimal(10) ** decimals)
+            log.info("   Curve sell attempt %d (slippage %.0f%%)", attempt, slippage)
+            try:
+                raw_tx = self.portal.build_transaction(
+                    self.pubkey, "sell", mint, ui_amount, False, slippage,
+                    self.cfg.CURVE_PRIORITY_FEE_SOL, "pump")
+            except Exception as exc:
+                log.error("Could not build curve sell (%s); nothing sent", type(exc).__name__)
+                return None
+            outcome = self._submit_and_settle("sell", mint, raw_tx, {
+                "route": "pump", "sol_usd": sol_usd,
+                "symbol": position.get("token_symbol", "TOKEN"), "amount_raw": amount_raw,
+                "usdc_spent": position.get("usdc_spent", 0),
+                "reason": reason, "exit_price": exit_price,
+                "cycle": cycle if cycle is not None else self.j.data["cycle"] + 1,
+            })
+            if outcome == "confirmed":
+                proceeds = self._finalize_sell()
+                if proceeds is None:
+                    log.error("   Curve sell confirmed but unreconciled; no resend.")
+                return proceeds
+            if outcome in ("unknown", "aborted"):
+                log.error("   Curve sell outcome %s; refusing to resend until reconciled.", outcome)
+                return None
+            log.error("   Curve sell failed on-chain (attempt %d)", attempt)
+            time.sleep(2)
+        log.error("   Curve sell failed after all attempts; position kept for review.")
+        return None
+
     # ── Buy ───────────────────────────────────────────────────────────────────
     def execute_buy(self, usdc_amount: float, token: TokenCandidate) -> dict | None:
         if usdc_amount <= 0:
             raise ValueError("Buy amount must be positive")
         if token is None or not getattr(token, "mint", None):
             raise ValueError("Token candidate is missing a mint address")
+        if not self.cfg.DRY_RUN:
+            # Defense in depth: run_cycle also checks these before scanning.
+            validate_live_config(self.cfg)
+            if kill_switch_active(self.cfg):
+                raise LiveTradingConfigError("Kill switch active; refusing new live buy")
+            if usdc_amount > float(self.cfg.MAX_POSITION_USDC):
+                raise LiveTradingConfigError(
+                    f"Buy ${usdc_amount:.4f} exceeds MAX_POSITION_USDC; refusing")
+            if self.j.data.get("pending_tx"):
+                log.error("Refusing buy: an earlier transaction is unresolved")
+                return None
+            if self.j.data.get("open_position"):
+                log.error("Refusing buy: a position is already open")
+                return None
 
         log.info(f"📥 BUY  ${usdc_amount:.4f} USDC → {token.symbol} ({token.mint[:8]}...)")
+
+        if not self.cfg.DRY_RUN and self.cfg.CURVE_TRADING:
+            try:
+                curve = self._curve_state(token.mint)
+            except (RpcError, ValueError) as exc:
+                log.error("Curve state unknown (%s); refusing buy", exc)
+                return None
+            if curve is not None and not curve["complete"]:
+                if (curve["quote_mint"] != WSOL_MINT or curve["is_cashback_coin"]
+                        or curve["is_mayhem_mode"]):
+                    log.error("Curve is not a plain SOL-paired coin (unverified route); refusing buy")
+                    return None
+                return self._curve_buy(usdc_amount, token, curve)
+            # No curve account or a completed curve: fall through to Jupiter.
 
         amount_lam = usdc_to_lamports(usdc_amount)
         quote = self.jup.get_quote(self.cfg.INPUT_MINT, token.mint, amount_lam)
@@ -569,12 +1213,20 @@ class CompoundingBot:
             log.warning("   [DRY RUN] Skipping real transaction.")
             sig = "DRY_RUN_BUY"
         else:
-            raw_tx = self.jup.build_swap_transaction(quote, self.pubkey)
-            sig = self.jup.sign_and_send(raw_tx, self.keypair)
-            log.info(f"   TX: https://solscan.io/tx/{sig}")
-            if not self.jup.confirm_transaction(sig):
-                log.error("Buy TX not confirmed — aborting cycle.")
+            try:
+                raw_tx = self.jup.build_swap_transaction(quote, self.pubkey)
+            except Exception as exc:
+                log.error("Could not build buy transaction (%s); nothing sent", type(exc).__name__)
                 return None
+            outcome = self._submit_and_settle("buy", token.mint, raw_tx, {
+                "symbol": token.symbol, "dex_url": token.url,
+                "token_decimals": token_decimals, "usdc_amount": usdc_amount,
+                "quoted_token_amount": token_amount, "quoted_entry_price": entry_price,
+            })
+            if outcome != "confirmed":
+                log.error("Buy not confirmed (%s) — no position opened.", outcome)
+                return None
+            return self._finalize_buy()
 
         position = {
             "buy_tx": sig,
@@ -593,7 +1245,33 @@ class CompoundingBot:
         return position
 
     # ── Sell ──────────────────────────────────────────────────────────────────
-    def execute_sell(self, position: dict, reason: str = "target") -> float | None:
+    def _prepare_live_sell(self, position: dict, expected_raw: int) -> tuple:
+        """Gate every live sell attempt on chain truth. Returns (state, value):
+        ('sold', proceeds) | ('blocked', None) | ('ready', raw_amount_to_sell)."""
+        if self.j.data.get("pending_tx"):
+            res = self.reconcile_pending()
+            if res.get("kind") == "sell" and res.get("state") == "confirmed":
+                return "sold", res["proceeds"]
+            log.error("   Earlier transaction unresolved (%s); not selling.", res.get("state"))
+            return "blocked", None
+        try:
+            balance = self.rpc.token_balance(self.pubkey, position["token_mint"])
+        except RpcError as exc:
+            log.error("   Cannot read on-chain balance (%s); not selling.", exc)
+            return "blocked", None
+        if balance <= 0:
+            log.error("   On-chain balance is 0 while the journal has an open position. "
+                      "Keeping the position blocked for MANUAL REVIEW; no new trade.")
+            position["manual_review"] = True
+            self.j.data["open_position"] = position
+            self.j.save()
+            return "blocked", None
+        return "ready", min(balance, expected_raw)
+
+    def execute_sell(
+        self, position: dict, reason: str = "target",
+        exit_price: float = 0.0, cycle: int | None = None,
+    ) -> float | None:
         token_amount = position["token_amount"]
         token_mint = position["token_mint"]
         token_decimals = position.get("token_decimals", 6)
@@ -606,6 +1284,16 @@ class CompoundingBot:
         log.info(f"📤 SELL {token_amount:.6f} {symbol} → USDC ({reason})")
 
         amount_lam = int(token_amount * (10 ** token_decimals))
+
+        if not self.cfg.DRY_RUN and position.get("route") == "pump":
+            try:
+                curve = self._curve_state(token_mint)
+            except (RpcError, ValueError) as exc:
+                log.error("   Curve state unknown (%s); not selling blind.", exc)
+                return None
+            if curve is not None and not curve["complete"]:
+                return self._curve_sell(position, reason, exit_price, cycle, amount_lam, token_decimals)
+            log.warning("   Curve is complete or gone (graduated); trying the Jupiter route.")
 
         if reason == "zero_liquidity":
             log.warning("   Pool liquidity is effectively $0 — probing Jupiter once for an alternate route before giving up...")
@@ -645,6 +1333,13 @@ class CompoundingBot:
 
         for attempt, slippage in enumerate(slippage_schedule, 1):
             log.info(f"   Attempt {attempt}/{len(slippage_schedule)} (slippage={slippage}bps = {slippage/100:.1f}%)")
+            if not self.cfg.DRY_RUN:
+                state, value = self._prepare_live_sell(position, amount_lam)
+                if state == "sold":
+                    return value
+                if state == "blocked":
+                    return None
+                amount_lam = value
             try:
                 quote = self.jup.get_quote(
                     token_mint, self.cfg.INPUT_MINT, amount_lam,
@@ -678,22 +1373,29 @@ class CompoundingBot:
 
             try:
                 raw_tx = self.jup.build_swap_transaction(quote, self.pubkey)
-                sig = self.jup.sign_and_send(raw_tx, self.keypair)
-                log.info(f"   TX: https://solscan.io/tx/{sig}")
-            except RuntimeError as e:
-                log.error(f"   ❌ Send failed: {e}")
+            except Exception as e:
+                log.error(f"   ❌ Could not build sell transaction ({type(e).__name__}); nothing sent")
                 if attempt < len(slippage_schedule):
-                    log.info("   Retrying with higher slippage...")
                     time.sleep(2)
                     continue
                 log.error("   All attempts exhausted. Sell manually on jup.ag.")
                 return None
 
-            if self.jup.confirm_transaction(sig):
-                self.j.data["open_position"] = None
-                self.j.save()
-                return usdc_out
-            log.error(f"   Sell not confirmed (attempt {attempt})")
+            outcome = self._submit_and_settle("sell", token_mint, raw_tx, {
+                "symbol": symbol, "amount_raw": amount_lam, "usdc_spent": usdc_spent,
+                "reason": reason, "exit_price": exit_price,
+                "cycle": cycle if cycle is not None else self.j.data["cycle"] + 1,
+            })
+            if outcome == "confirmed":
+                proceeds = self._finalize_sell()
+                if proceeds is not None:
+                    return proceeds
+                log.error("   Sell confirmed but unreconciled; no resend. Position kept for review.")
+                return None
+            if outcome in ("unknown", "aborted"):
+                log.error(f"   Sell outcome {outcome}; refusing to resend until reconciled.")
+                return None
+            log.error(f"   Sell failed on-chain (attempt {attempt})")
             if attempt < len(slippage_schedule):
                 time.sleep(2)
                 continue
@@ -890,9 +1592,39 @@ class CompoundingBot:
                  f"Consec losses: {self.j.data.get('consec_losses', 0)}")
         log.info(f"{'='*60}")
 
+        if not self.cfg.DRY_RUN and self.j.data.get("pending_tx"):
+            res = self.reconcile_pending()
+            if self.j.data.get("pending_tx"):
+                log.error("🛑 Unresolved transaction (%s) — all trading paused until reconciled.",
+                          res.get("state"))
+                return False
+
         position = self.j.data.get("open_position")
+        if position and position.get("manual_review"):
+            log.error("🛑 Open position requires manual review; refusing automated trading.")
+            return False
 
         if not position:
+            if not self.cfg.DRY_RUN:
+                if kill_switch_active(self.cfg):
+                    log.error("🛑 Kill switch active — no new live entries. Remove the file to resume.")
+                    return False
+                loss_cap = float(self.cfg.MAX_DAILY_LOSS_USDC)
+                loss_today = -self.j.realized_pnl_today()
+                if loss_today >= loss_cap:
+                    log.error(
+                        f"🛑 Daily loss cap reached (${loss_today:.2f} >= ${loss_cap:.2f}) — "
+                        f"no new live entries today."
+                    )
+                    return False
+                max_position = float(self.cfg.MAX_POSITION_USDC)
+                if play_amount > max_position:
+                    log.warning(
+                        f"⚠️  Play amount ${play_amount:.4f} capped to "
+                        f"MAX_POSITION_USDC ${max_position:.4f}"
+                    )
+                    play_amount = max_position
+
             if self.cfg.DRY_RUN:
                 log.info("🔍 Dry-run mode: scanning without checking wallet balances.")
             elif not self.check_balances(play_amount):
@@ -920,11 +1652,17 @@ class CompoundingBot:
                 return False
 
         reason, exit_price = self.monitor_price(position)
-        usdc_received = self.execute_sell(position, reason)
+        usdc_received = self.execute_sell(position, reason, exit_price, cycle)
         if usdc_received is None:
             return False
 
+        if not self.cfg.DRY_RUN:
+            # _finalize_sell commits the actual proceeds and cycle accounting
+            # together with clearing pending_tx/open_position.
+            return True
+
         win = reason == "target"
+        self.j.record_pnl(usdc_received - position.get("usdc_spent", play_amount))
         if win:
             next_play = usdc_received * self.cfg.REINVEST_PCT
             saved = usdc_received * self.cfg.SAVE_PCT
@@ -965,6 +1703,14 @@ class CompoundingBot:
         log.info("🚀 CryptoBot starting...")
         if self.cfg.DRY_RUN:
             log.warning("⚠️  DRY RUN MODE — no real transactions will be sent")
+        elif self.j.data.get("pending_tx"):
+            result = self.reconcile_pending()
+            if self.j.data.get("pending_tx"):
+                log.error(
+                    "Startup reconciliation unresolved (%s); refusing to continue.",
+                    result.get("state"),
+                )
+                return
 
         # Do not display hypothetical compounding as expected/actual profit.
         # MAX_CYCLES=0 (default) means run until Ctrl+C. A positive value limits
@@ -972,7 +1718,9 @@ class CompoundingBot:
         if self.cfg.DRY_RUN:
             log.info("💳 [DRY RUN] No wallet balance is checked; no real transactions will be sent.")
             log.info("📈 Paper mode uses live quotes/prices where available; results are not guaranteed.")
-        elif not self.check_balances(self.j.data["play_amount_usdc"]):
+        elif not self.check_balances(
+            0.0 if self.j.data.get("open_position") else self.j.data["play_amount_usdc"]
+        ):
             log.error("Wallet balance verification failed; refusing to start live.")
             sys.exit(1)
 
@@ -1021,7 +1769,11 @@ if __name__ == "__main__":
         print("ERROR: Set WALLET_PRIVATE_KEY in .env before disabling DRY_RUN")
         sys.exit(1)
 
-    bot = CompoundingBot(cfg)
+    try:
+        bot = CompoundingBot(cfg)
+    except (LiveTradingConfigError, JournalCorruptError) as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
     try:
         bot.run()
     except KeyboardInterrupt:
