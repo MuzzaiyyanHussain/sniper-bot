@@ -15,6 +15,7 @@ import json
 import requests
 import websockets
 from dataclasses import dataclass, field
+from typing import Callable
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ def parse_sol_amount(event: dict, max_reasonable_sol: float = 1_000.0) -> float 
 @dataclass
 class ScannerConfig:
     # Age window — with WebSocket we catch tokens in seconds
-    max_age_minutes:      int   = 2        # reject candidates older than 2 minutes
+    max_age_minutes:      int   = 5        # reject candidates older than 5 minutes
     min_age_minutes:      int   = 0         # no minimum — catch at birth
 
     # Liquidity — pump.fun pools start very small
@@ -52,7 +53,7 @@ class ScannerConfig:
     max_liquidity_usd:    float = 500_000
 
     # Volume
-    min_volume_5m_usd:    float = 500
+    min_volume_5m_usd:    float = 300
 
     # Price action
     min_price_change_5m:  float = -30.0     # allow slight dip on entry
@@ -63,8 +64,8 @@ class ScannerConfig:
     max_market_cap_usd:   float = 10_000_000
 
     # Transactions
-    min_txns_5m:          int   = 12
-    min_buys_5m:          int   = 8
+    min_txns_5m:          int   = 5
+    min_buys_5m:          int   = 3
     min_buy_sell_ratio:   float = 1.3
 
     # Holder safety
@@ -84,7 +85,8 @@ class ScannerConfig:
     max_parallel_evaluations: int = 4
 
     # How long to wait for DexScreener pair data after token launch (seconds)
-    pair_wait_sec:        int   = 25
+    pair_wait_sec:        int   = 35
+    pair_poll_interval_sec: float = 2.0
 
     # Fallback polling interval if WebSocket fails
     scan_interval_sec:    int   = 30
@@ -96,6 +98,13 @@ class ScannerConfig:
 # ════════════════════════════════════════════════════════════════════════════════
 # TOKEN CANDIDATE
 # ════════════════════════════════════════════════════════════════════════════════
+@dataclass
+class CurveReserveMetrics:
+    liquidity_usd: float
+    price_usd: float
+    market_cap_usd: float
+
+
 @dataclass
 class TokenCandidate:
     mint:            str
@@ -118,6 +127,7 @@ class TokenCandidate:
     score:           float = 0.0
     url:             str   = ""
     initial_buy_sol: float | None = None   # SOL spent by creator, if supplied by the event
+    liquidity_source: str = "DexScreener"
 
     @property
     def buy_sell_ratio(self) -> float:
@@ -264,6 +274,7 @@ class DexScreenerClient:
         pair: dict,
         initial_buy_sol: float | None = None,
         expected_mint: str | None = None,
+        curve_metrics: CurveReserveMetrics | None = None,
     ) -> "TokenCandidate | None":
         """Parse DexScreener data, rejecting malformed/non-finite numeric values."""
         try:
@@ -325,17 +336,21 @@ class DexScreenerClient:
                 if isinstance(liquidity_data, dict)
                 else None
             )
+            liquidity_source = "DexScreener"
             if liquidity_raw is None:
-                log.warning(
-                    "SKIP-CANDIDATE: liquidity unavailable from DexScreener "
-                    "| mint=%s | dex=%s | pair=%s | price_usd=%s "
-                    "| eligibility=FAIL-CLOSED",
-                    mint,
-                    pair.get("dexId", "unknown"),
-                    pair.get("pairAddress", "unknown"),
-                    pair.get("priceUsd", "unknown"),
-                )
-                return None
+                if curve_metrics is None:
+                    log.warning(
+                        "SKIP-CANDIDATE: liquidity unavailable from DexScreener "
+                        "| mint=%s | dex=%s | pair=%s | price_usd=%s "
+                        "| eligibility=FAIL-CLOSED",
+                        mint,
+                        pair.get("dexId", "unknown"),
+                        pair.get("pairAddress", "unknown"),
+                        pair.get("priceUsd", "unknown"),
+                    )
+                    return None
+                liquidity_raw = curve_metrics.liquidity_usd
+                liquidity_source = "Pump.fun real quote reserves"
             liquidity = nonnegative(liquidity_raw, "liquidity")
 
             volume = pair.get("volume") or {}
@@ -351,7 +366,18 @@ class DexScreenerClient:
             if not isinstance(txns_5m, dict):
                 return None
 
-            price_usd = nonnegative(pair.get("priceUsd"), "priceUsd")
+            try:
+                price_usd = nonnegative(pair.get("priceUsd"), "priceUsd")
+            except ValueError:
+                if curve_metrics is None:
+                    raise
+                price_usd = nonnegative(
+                    curve_metrics.price_usd, "curve priceUsd"
+                )
+            if price_usd <= 0 and curve_metrics is not None:
+                price_usd = nonnegative(
+                    curve_metrics.price_usd, "curve priceUsd"
+                )
             volume_5m = nonnegative(volume.get("m5"), "volume.m5")
             volume_1h = nonnegative(volume.get("h1"), "volume.h1")
             price_change_5m = number(
@@ -364,7 +390,18 @@ class DexScreenerClient:
             market_cap_raw = pair.get("marketCap")
             if market_cap_raw is None or market_cap_raw == "":
                 market_cap_raw = pair.get("fdv")
-            market_cap = nonnegative(market_cap_raw, "marketCap/fdv")
+            try:
+                market_cap = nonnegative(market_cap_raw, "marketCap/fdv")
+            except ValueError:
+                if curve_metrics is None:
+                    raise
+                market_cap = nonnegative(
+                    curve_metrics.market_cap_usd, "curve marketCap"
+                )
+            if market_cap <= 0 and curve_metrics is not None:
+                market_cap = nonnegative(
+                    curve_metrics.market_cap_usd, "curve marketCap"
+                )
 
             buys = number(txns_5m.get("buys"), "txns.m5.buys")
             sells = number(txns_5m.get("sells"), "txns.m5.sells")
@@ -393,6 +430,7 @@ class DexScreenerClient:
                 txns_5m_sells=int(sells),
                 age_minutes=age_min,
                 initial_buy_sol=initial_buy_sol,
+                liquidity_source=liquidity_source,
                 url=pair.get("url") or f"https://dexscreener.com/solana/{mint}",
             )
         except (TypeError, ValueError, OverflowError) as exc:
@@ -566,8 +604,14 @@ class PumpFunListener:
     When a token is created, waits for DexScreener pair data, then returns it.
     """
 
-    def __init__(self, cfg: ScannerConfig, birdeye_api_key: str = ""):
+    def __init__(
+        self,
+        cfg: ScannerConfig,
+        birdeye_api_key: str = "",
+        curve_metrics_provider: Callable[[str], CurveReserveMetrics | None] | None = None,
+    ):
         self.cfg = cfg
+        self.curve_metrics_provider = curve_metrics_provider
         self.dex = DexScreenerClient()
         self.holders = BirdeyeHolderClient(birdeye_api_key)
         self.rug = RugDetector()
@@ -639,7 +683,7 @@ class PumpFunListener:
 
             remaining = deadline - time.monotonic()
             if remaining > 0:
-                time.sleep(min(1.0, remaining))
+                time.sleep(min(self.cfg.pair_poll_interval_sec, remaining))
 
         if not matching_pairs:
             log.info(
@@ -648,14 +692,30 @@ class PumpFunListener:
             )
             return None
 
+        curve_metrics = None
+        if self.curve_metrics_provider and any(
+            not isinstance(pair.get("liquidity"), dict)
+            or pair["liquidity"].get("usd") is None
+            for pair in matching_pairs
+        ):
+            curve_metrics = self.curve_metrics_provider(mint)
+
         # Evaluate each exact-mint pair independently. An old/high-liquidity
         # pool must not hide another pair that may pass the existing filters.
         eligible = []
 
         for pair in matching_pairs:
-            candidate = self.dex.parse_pair(
-                pair, initial_buy_sol, expected_mint=mint
-            )
+            if curve_metrics is None:
+                candidate = self.dex.parse_pair(
+                    pair, initial_buy_sol, expected_mint=mint
+                )
+            else:
+                candidate = self.dex.parse_pair(
+                    pair,
+                    initial_buy_sol,
+                    expected_mint=mint,
+                    curve_metrics=curve_metrics,
+                )
             if candidate is None:
                 continue
 
@@ -943,9 +1003,18 @@ class PumpFunListener:
 class TokenScanner:
     """Drop-in replacement — same interface as the old polling scanner."""
 
-    def __init__(self, cfg: ScannerConfig, birdeye_api_key: str = ""):
+    def __init__(
+        self,
+        cfg: ScannerConfig,
+        birdeye_api_key: str = "",
+        curve_metrics_provider: Callable[[str], CurveReserveMetrics | None] | None = None,
+    ):
         self.cfg      = cfg
-        self.listener = PumpFunListener(cfg, birdeye_api_key=birdeye_api_key)
+        self.listener = PumpFunListener(
+            cfg,
+            birdeye_api_key=birdeye_api_key,
+            curve_metrics_provider=curve_metrics_provider,
+        )
 
     def find_best(self, max_wait_minutes: int = 15) -> "TokenCandidate | None":
         log.info("📡 Listening for new pump.fun launches via WebSocket...")

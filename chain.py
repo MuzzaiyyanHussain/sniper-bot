@@ -12,8 +12,8 @@ from decimal import Decimal
 
 import requests
 
-# Pump.fun bonding-curve program. NOT verified against the live chain in this
-# project; confirm before relying on the derived address.
+# Pump.fun program id matched the owner of one live curve account; broader
+# account/version compatibility has not been established.
 PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMPPORTAL_TRADE_LOCAL_URL = "https://pumpportal.fun/api/trade-local"
 
@@ -100,7 +100,7 @@ class RpcClient:
             raise RpcError("incomplete transaction metadata") from exc
         return post[idx] - pre[idx], fee
 
-    def account_data(self, address: str):
+    def account_data(self, address: str, expected_owner: str | None = None):
         """Raw account bytes at confirmed commitment, or None if it doesn't exist."""
         result = self.call(
             "getAccountInfo",
@@ -109,6 +109,10 @@ class RpcClient:
         value = result.get("value") if isinstance(result, dict) else None
         if value is None:
             return None
+        if not isinstance(value, dict):
+            raise RpcError("getAccountInfo returned an invalid account")
+        if expected_owner is not None and value.get("owner") != expected_owner:
+            raise RpcError("getAccountInfo returned an unexpected account owner")
         try:
             return base64.b64decode(value["data"][0], validate=True)
         except (KeyError, IndexError, TypeError, ValueError) as exc:
@@ -204,8 +208,9 @@ class PumpPortalLocalClient:
 # Layout from the official pump-fun/pump-public-docs IDL `BondingCurve` type:
 # discriminator, 5 x u64 (virtual token, virtual quote, real token, real quote,
 # total supply), bool complete, pubkey creator, bool is_mayhem_mode,
-# bool is_cashback_coin, pubkey quote_mint, ... Only this verified prefix is
-# decoded. It has not been compared with a live mainnet account.
+# bool is_cashback_coin, pubkey quote_mint, ... Only this prefix is decoded.
+# It parsed successfully for one live mainnet account; broader version
+# compatibility has not been established.
 BONDING_CURVE_DISCRIMINATOR = bytes([23, 183, 248, 55, 96, 216, 172, 96])
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 _CURVE_STRUCT = struct.Struct("<8s5QB32sBB32s")

@@ -18,16 +18,20 @@ import shutil
 import logging
 import requests
 import base58
+import threading
 from datetime import datetime
 from decimal import Decimal
 from dotenv import load_dotenv
 
 from solders.keypair import Keypair
 from solders.transaction import VersionedTransaction
-from token_scanner import TokenScanner, ScannerConfig, TokenCandidate, DexScreenerClient
+from token_scanner import (
+    TokenScanner, ScannerConfig, TokenCandidate, DexScreenerClient,
+    CurveReserveMetrics,
+)
 from chain import (
-    RpcClient, RpcError, PumpPortalLocalClient, WSOL_MINT,
-    bonding_curve_address, parse_bonding_curve,
+    RpcClient, RpcError, PumpPortalLocalClient, PUMPFUN_PROGRAM_ID, WSOL_MINT,
+    bonding_curve_address, parse_bonding_curve, curve_price_sol,
 )
 
 load_dotenv()
@@ -73,6 +77,7 @@ class Config:
     POLL_INTERVAL_SEC:     int   = int(os.getenv("POLL_INTERVAL_SEC", "8"))
     PRICE_TARGET_MULT:     float = float(os.getenv("PRICE_TARGET_MULT", "2.0"))
     STOP_LOSS_MULT:        float = float(os.getenv("STOP_LOSS_MULT", "0.82"))
+    TRAILING_DRAWDOWN_PCT: float = float(os.getenv("TRAILING_DRAWDOWN_PCT", "20"))
     MAX_CYCLES:            int   = int(os.getenv("MAX_CYCLES", "0"))  # 0 = run until Ctrl+C
     SLIPPAGE_BPS:          int   = int(os.getenv("SLIPPAGE_BPS", "50"))
     PRIORITY_FEE_LAMPORTS: int   = int(os.getenv("PRIORITY_FEE_LAMPORTS", "1000"))
@@ -596,6 +601,19 @@ class Journal:
             or position["usdc_spent"] < 0
         ):
             raise ValueError("journal open_position is invalid")
+        if position is not None:
+            if "trailing_active" in position and not isinstance(position["trailing_active"], bool):
+                raise ValueError("journal open_position trailing_active is invalid")
+            peak = position.get("trailing_peak_price")
+            if position.get("trailing_active") and peak is None:
+                raise ValueError("journal open_position trailing peak is missing")
+            if peak is not None and (
+                isinstance(peak, bool)
+                or not isinstance(peak, (int, float))
+                or not math.isfinite(peak)
+                or peak <= 0
+            ):
+                raise ValueError("journal open_position trailing_peak_price is invalid")
         pending = data["pending_tx"]
         if pending is not None:
             if (
@@ -689,6 +707,16 @@ class Journal:
 class CompoundingBot:
     def __init__(self, cfg: Config):
         self.cfg    = cfg
+        if (
+            not math.isfinite(cfg.PRICE_TARGET_MULT)
+            or cfg.PRICE_TARGET_MULT <= 1
+            or not math.isfinite(cfg.TRAILING_DRAWDOWN_PCT)
+            or not 0 < cfg.TRAILING_DRAWDOWN_PCT < 100
+        ):
+            raise ValueError(
+                "PRICE_TARGET_MULT must exceed 1 and TRAILING_DRAWDOWN_PCT "
+                "must be between 0 and 100"
+            )
         validate_live_config(cfg)
         self.calc   = StrategyCalc(cfg)
         self.jup    = JupiterClient(cfg)
@@ -696,7 +724,13 @@ class CompoundingBot:
         self.j      = Journal(strict=not cfg.DRY_RUN)
         self.rpc    = RpcClient(cfg.SOLANA_RPC_URL)
         self.portal = PumpPortalLocalClient()
-        self.scanner = TokenScanner(ScannerConfig(), birdeye_api_key=os.getenv("BIRDEYE_API_KEY", ""))
+        self._curve_metrics_lock = threading.Lock()
+        self._curve_sol_usd_cache: tuple[float, float] | None = None
+        self.scanner = TokenScanner(
+            ScannerConfig(),
+            birdeye_api_key=os.getenv("BIRDEYE_API_KEY", ""),
+            curve_metrics_provider=self._curve_reserve_metrics,
+        )
 
         if self.cfg.DRY_RUN:
             self.keypair = None
@@ -951,6 +985,8 @@ class CompoundingBot:
             "entry_price": entry_price,
             "target_price": entry_price * self.cfg.PRICE_TARGET_MULT,
             "stop_price": entry_price * self.cfg.STOP_LOSS_MULT if self.cfg.STOP_LOSS_MULT > 0 else 0,
+            "trailing_active": False,
+            "trailing_peak_price": None,
             "token_mint": p["mint"],
             "dex_url": meta.get("dex_url", ""),
             "fill_source": "onchain",
@@ -1003,7 +1039,7 @@ class CompoundingBot:
         reason = meta.get("reason", "recovered_sell")
         cycle = meta.get("cycle", self.j.data["cycle"] + 1)
         exit_price = meta.get("exit_price", 0.0)
-        win = reason == "target"
+        win = proceeds > spent
         next_play = proceeds * self.cfg.REINVEST_PCT if win else proceeds
         saved = proceeds * self.cfg.SAVE_PCT if win else 0.0
 
@@ -1068,8 +1104,68 @@ class CompoundingBot:
         """Parsed curve, or None when no curve account exists.
 
         Raises RpcError/ValueError when the state cannot be trusted."""
-        data = self.rpc.account_data(bonding_curve_address(mint))
+        data = self.rpc.account_data(
+            bonding_curve_address(mint),
+            expected_owner=PUMPFUN_PROGRAM_ID,
+        )
         return None if data is None else parse_bonding_curve(data)
+
+    def _curve_reserve_metrics(self, mint: str) -> CurveReserveMetrics | None:
+        """Return verified WSOL curve reserve metrics for missing DEX liquidity."""
+        with self._curve_metrics_lock:
+            try:
+                curve = self._curve_state(mint)
+                if (
+                    curve is None
+                    or curve["complete"]
+                    or curve["quote_mint"] != WSOL_MINT
+                    or curve["is_cashback_coin"]
+                    or curve["is_mayhem_mode"]
+                ):
+                    return None
+
+                now = time.monotonic()
+                if (
+                    self._curve_sol_usd_cache is None
+                    or now - self._curve_sol_usd_cache[0] >= 30
+                ):
+                    sol_usd = self._sol_usd()
+                    self._curve_sol_usd_cache = (now, sol_usd)
+                else:
+                    sol_usd = self._curve_sol_usd_cache[1]
+
+                decimals = self.oracle.get_token_decimals(mint)
+                price_usd = curve_price_sol(curve, decimals) * sol_usd
+                supply = curve["token_total_supply"] / (10 ** decimals)
+                liquidity_usd = (
+                    curve["real_quote_reserves"] / 1e9
+                ) * sol_usd
+                market_cap_usd = price_usd * supply
+                values = (liquidity_usd, price_usd, market_cap_usd)
+                if any(not math.isfinite(value) or value <= 0 for value in values):
+                    return None
+
+                log.info(
+                    "Using Pump.fun real quote reserves for %s liquidity: $%.2f",
+                    mint[:8],
+                    liquidity_usd,
+                )
+                return CurveReserveMetrics(*values)
+            except (
+                RpcError,
+                ValueError,
+                RuntimeError,
+                requests.RequestException,
+                KeyError,
+                TypeError,
+                OverflowError,
+            ) as exc:
+                log.warning(
+                    "On-chain liquidity fallback unavailable for %s (%s)",
+                    mint[:8],
+                    type(exc).__name__,
+                )
+                return None
 
     def _curve_buy(self, usdc_amount: float, token: TokenCandidate, curve: dict) -> dict | None:
         try:
@@ -1240,6 +1336,8 @@ class CompoundingBot:
             "entry_price": entry_price,
             "target_price": target_price,
             "stop_price": stop_price,
+            "trailing_active": False,
+            "trailing_peak_price": None,
             "token_mint": token.mint,
             "dex_url": token.url,
         }
@@ -1319,7 +1417,7 @@ class CompoundingBot:
                 self.j.data["open_position"] = position
                 self.j.save()
                 return None
-        elif reason in ("stop_loss", "no_price"):
+        elif reason in ("stop_loss", "trailing_stop", "no_price"):
             slippage_schedule = [
                 self.cfg.SLIPPAGE_BPS,
                 500,
@@ -1359,7 +1457,7 @@ class CompoundingBot:
             usdc_out = int(quote["outAmount"]) / (10 ** USDC_DECIMALS)
             log.info(f"   Quote: ${usdc_out:.4f} USDC")
 
-            if reason == "target" and usdc_spent > 0 and attempt == 1:
+            if reason in ("target", "trailing_stop") and usdc_spent > 0 and attempt == 1:
                 if usdc_out < usdc_spent * 0.50:
                     log.warning(
                         f"   ⚠️  Quote ${usdc_out:.4f} < 50% of entry. "
@@ -1414,7 +1512,14 @@ class CompoundingBot:
         stop   = position["stop_price"]
         mint   = position["token_mint"]
         symbol = position.get("token_symbol", mint[:8])
-        log.info(f"👁  Monitoring {symbol} | Target=${target:.8f} | Stop={'off' if stop==0 else f'${stop:.8f}'}")
+        drawdown = self.cfg.TRAILING_DRAWDOWN_PCT / 100
+        if not 0 < drawdown < 1:
+            raise ValueError("TRAILING_DRAWDOWN_PCT must be between 0 and 100")
+        log.info(
+            f"👁  Monitoring {symbol} | Trail activates=${target:.8f} "
+            f"({self.cfg.PRICE_TARGET_MULT}x, {self.cfg.TRAILING_DRAWDOWN_PCT:.1f}% pullback) | "
+            f"Stop={'off' if stop==0 else f'${stop:.8f}'}"
+        )
 
         # ── Stop-loss confirmation ────────────────────────────────────────────
         # A breach exits immediately only if is_sustained_crash() says the price
@@ -1434,6 +1539,9 @@ class CompoundingBot:
 
         start_time = time.time()
         stop_wick_seen = False  # Track if we saw one wick; exit if still breached next tick
+        trailing_wick_seen = False
+        trailing_active = position.get("trailing_active", False)
+        trailing_peak_price = position.get("trailing_peak_price")
         recent_prices = [position["entry_price"]]  # Rolling buffer of good prices
         last_good_price = position["entry_price"]
 
@@ -1517,8 +1625,42 @@ class CompoundingBot:
             pct = ((price - position["entry_price"]) / position["entry_price"]) * 100
             log.info(f"   {symbol}: ${price:.8f}  ({pct:+.1f}%)")
 
-            if price >= target:
-                return "target", price
+            if not trailing_active and price >= target:
+                trailing_active = True
+                trailing_peak_price = price
+                position["trailing_active"] = True
+                position["trailing_peak_price"] = price
+                self.j.data["open_position"] = position
+                self.j.save()
+                log.info(
+                    f"   📈 Trailing exit activated at ${price:.8f}; "
+                    f"holding while price makes new highs."
+                )
+            elif trailing_active and (
+                trailing_peak_price is None or price > trailing_peak_price
+            ):
+                trailing_peak_price = price
+                position["trailing_peak_price"] = price
+                self.j.data["open_position"] = position
+                self.j.save()
+
+            if trailing_active:
+                trailing_stop = trailing_peak_price * (1 - drawdown)
+                if price <= trailing_stop:
+                    if trailing_wick_seen:
+                        log.info(
+                            f"   🛑 Trailing stop confirmed: ${price:.8f} is below "
+                            f"${trailing_stop:.8f} after a {self.cfg.TRAILING_DRAWDOWN_PCT:.1f}% "
+                            f"pullback from peak ${trailing_peak_price:.8f}."
+                        )
+                        return "trailing_stop", price
+                    trailing_wick_seen = True
+                    log.warning(
+                        f"   ⚠️  Trailing level breached at ${price:.8f}; "
+                        f"confirming on next tick."
+                    )
+                else:
+                    trailing_wick_seen = False
 
             if stop > 0 and price <= stop:
                 if elapsed < BUY_WARMUP_SEC:
@@ -1664,7 +1806,7 @@ class CompoundingBot:
             # together with clearing pending_tx/open_position.
             return True
 
-        win = reason == "target"
+        win = usdc_received > position.get("usdc_spent", play_amount)
         self.j.record_pnl(usdc_received - position.get("usdc_spent", play_amount))
         if win:
             next_play = usdc_received * self.cfg.REINVEST_PCT
