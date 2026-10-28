@@ -65,6 +65,12 @@ class ScannerConfig:
     min_market_cap_usd:   float = 1_000
     max_market_cap_usd:   float = 10_000
 
+    # Entry run-up: the candidate's price comes from data that lags the live
+    # market by tens of seconds. If the price we would actually pay is already
+    # this much above the evaluated price, the move has happened without us.
+    # Dry-run sample: every entry >=1.30x its evaluated price lost; entries at
+    # <=1.13x were the only ones near flat or positive. Threshold sits between.
+    max_entry_runup_ratio: float = 1.25
     # Transactions
     min_txns_5m:          int   = 2
     min_buys_5m:          int   = 2

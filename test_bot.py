@@ -151,6 +151,10 @@ class TestDryRunSafety(unittest.TestCase):
         cfg.LOSS_PAUSE_SEC = 300
         cfg.STARTING_AMOUNT_USDC = 4.0
         cfg.MIN_PLAY_AMOUNT = 1.0
+        # Pin the live-gate values so the test never depends on a local .env.
+        cfg.MAX_DAILY_LOSS_USDC = "4"
+        cfg.MAX_POSITION_USDC = "4"
+        cfg.KILL_SWITCH_FILE = "NO_SUCH_KILL_SWITCH_FILE"
         bot = CompoundingBot.__new__(CompoundingBot)
         bot.cfg = cfg
         bot.j = SimpleNamespace(
@@ -1812,6 +1816,30 @@ class TestTransactionReconciliation(TestLiveTradingGate):
         self.bot.jup.build_swap_transaction.assert_not_called()
         self.bot.jup.submit_encoded.assert_not_called()
         self.assertIsNone(self.bot.j.data.get("pending_tx"))
+
+    def test_buy_refused_when_entry_ran_up_past_limit_even_within_market_cap(self):
+        cand = make_candidate(price_usd=0.3, market_cap=4_000.0)
+        # $2 for 5.0 tokens = 0.40 -> 1.33x the evaluated price; implied mcap
+        # ~5,333 is still far below the cap, so only the run-up limit refuses.
+        self.bot.jup.get_quote.return_value = {"outAmount": "5000000"}
+        with self.assertLogs("bot", level="WARNING") as logs:
+            self.assertIsNone(self.bot.execute_buy(2.0, cand))
+        output = "\n".join(logs.output)
+        self.assertIn("ran up since evaluation", output)
+        self.assertIn("1.33x", output)
+        self.bot.jup.build_swap_transaction.assert_not_called()
+        self.bot.jup.submit_encoded.assert_not_called()
+        self.assertIsNone(self.bot.j.data.get("pending_tx"))
+
+    def test_buy_allowed_when_entry_runup_is_within_limit(self):
+        cand = make_candidate(price_usd=0.3, market_cap=4_000.0)
+        # $2 for 5.4 tokens = 0.3704 -> 1.23x, under the 1.25x limit.
+        self.bot.jup.get_quote.return_value = {"outAmount": "5400000"}
+        self.bot.jup.submit_encoded.side_effect = lambda signed: (self.land_buy(), "SIG1")[1]
+        self.assertIsNotNone(self.bot.execute_buy(2.0, cand))
+
+    def test_entry_runup_limit_default_is_1_25x(self):
+        self.assertEqual(ScannerConfig().max_entry_runup_ratio, 1.25)
 
     def test_buy_allowed_when_entry_stays_within_market_cap_cap(self):
         # 6 tokens for $2 = 0.333/token -> implied mcap ~8,889 (< 10,000).

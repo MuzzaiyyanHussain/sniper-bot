@@ -1418,6 +1418,15 @@ class CompoundingBot:
             log.error("   Cannot verify entry market cap for %s; refusing buy.", token.symbol)
             return None
         implied_mcap = token.market_cap * (entry_price / token.price_usd)
+        runup = entry_price / token.price_usd
+        max_runup = self.scanner.cfg.max_entry_runup_ratio
+        if runup > max_runup:
+            log.warning(
+                "   ⛔ %s ran up since evaluation: entry $%.8f is %.2fx the evaluated "
+                "price $%.8f (limit %.2fx) — refusing buy.",
+                token.symbol, entry_price, runup, token.price_usd, max_runup,
+            )
+            return None
         if implied_mcap > max_cap:
             log.warning(
                 "   ⛔ %s ran up since evaluation: entry implies mcap $%s > cap $%s "
