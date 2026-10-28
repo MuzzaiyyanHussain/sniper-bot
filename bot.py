@@ -143,6 +143,9 @@ class Config:
     # If no usable price is seen for this long while holding a position, give
     # up waiting and attempt an exit instead of polling forever. 0 disables.
     MAX_NO_PRICE_SEC:           int   = int(os.getenv("MAX_NO_PRICE_SEC", "120"))
+    # A position that never arms the trailing exit and never hits the stop would
+    # otherwise block every new entry forever (one position at a time). 0 = off.
+    MAX_HOLD_SEC:               int   = int(os.getenv("MAX_HOLD_SEC", "1200"))
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1841,6 +1844,14 @@ class CompoundingBot:
                 if stop_wick_seen:
                     log.info(f"   ✅ Price recovered above stop — resetting")
                 stop_wick_seen = False
+
+            if (self.cfg.MAX_HOLD_SEC > 0 and elapsed >= self.cfg.MAX_HOLD_SEC
+                    and not trailing_active):
+                log.info(
+                    f"   ⏱  {symbol} held {elapsed/60:.0f} min without arming the trailing "
+                    f"exit (price ${price:.8f}, {pct:+.1f}%) — exiting to free the slot."
+                )
+                return "max_hold", price
 
             # Update recent price buffer (keep last RECENT_PRICE_BUFFER good prices)
             recent_prices.append(price)

@@ -1328,6 +1328,46 @@ class TestStopLossMonitor(unittest.TestCase):
         self.assertEqual(result, ("trailing_stop", 1.2))
         self.assertEqual(position["trailing_peak_price"], 1.6)
 
+    def _hold_monitor(self, prices, max_hold, step=3.0):
+        clock = [1_000.0]
+        feed = iter(prices)
+        fake_self = SimpleNamespace(
+            oracle=SimpleNamespace(
+                get_price_and_liquidity=lambda _m: (next(feed), 10_000.0),
+            ),
+            cfg=Config(),
+            j=SimpleNamespace(data={}, save=MagicMock()),
+        )
+        fake_self.cfg.MAX_HOLD_SEC = max_hold
+        position = {
+            "target_price": 1.25, "stop_price": self.STOP,
+            "token_mint": "HoldMint1111", "token_symbol": "HD",
+            "entry_price": 1.0, "token_amount": 10.0, "token_decimals": 6,
+            "trailing_active": False, "trailing_peak_price": None,
+        }
+
+        def fake_sleep(_seconds):
+            clock[0] += step
+
+        with patch("bot.time.time", lambda: clock[0]), \
+                patch("bot.time.sleep", fake_sleep):
+            return CompoundingBot.monitor_price(fake_self, position)
+
+    def test_flat_position_exits_after_max_hold(self):
+        result = self._hold_monitor([0.9] * 50, max_hold=30)
+        self.assertEqual(result, ("max_hold", 0.9))
+
+    def test_max_hold_does_not_cut_a_position_with_trailing_armed(self):
+        with self.assertRaises(StopIteration):
+            self._hold_monitor([1.0, 1.3] + [1.3] * 30, max_hold=30)
+
+    def test_max_hold_disabled_when_zero(self):
+        with self.assertRaises(StopIteration):
+            self._hold_monitor([0.9] * 40, max_hold=0)
+
+    def test_max_hold_default_is_20_minutes(self):
+        self.assertEqual(Config.MAX_HOLD_SEC, 1200)
+
     # 1. Sustained crash exits immediately.
     def test_cascading_crash_exits_on_first_breach(self):
         result, polls = self.run_monitor([1.0, 0.90, 0.70])
