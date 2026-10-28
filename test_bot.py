@@ -54,7 +54,7 @@ def make_candidate(**overrides):
         volume_1h=8_000.0,
         price_change_5m=10.0,
         price_change_1h=12.0,
-        market_cap=120_000.0,
+        market_cap=8_000.0,
         txns_5m_buys=40,
         txns_5m_sells=15,
         age_minutes=1.0,
@@ -144,6 +144,38 @@ class TestDryRunSafety(unittest.TestCase):
         self.assertIsNone(bot.keypair)
         self.assertEqual(bot.pubkey, "DRY_RUN")
 
+    def _loss_streak_bot(self, dry_run):
+        cfg = Config()
+        cfg.DRY_RUN = dry_run
+        cfg.MAX_CONSEC_LOSSES = 2
+        cfg.LOSS_PAUSE_SEC = 300
+        cfg.STARTING_AMOUNT_USDC = 4.0
+        cfg.MIN_PLAY_AMOUNT = 1.0
+        bot = CompoundingBot.__new__(CompoundingBot)
+        bot.cfg = cfg
+        bot.j = SimpleNamespace(
+            data={"play_amount_usdc": 4.0, "consec_losses": 3, "open_position": None,
+                  "cycle": 0, "pending_tx": None},
+            save=MagicMock(),
+            realized_pnl_today=MagicMock(side_effect=RuntimeError("stop here")),
+        )
+        bot.check_balances = MagicMock(side_effect=RuntimeError("stop here"))
+        bot.scanner = SimpleNamespace(find_best=MagicMock(side_effect=RuntimeError("stop here")))
+        return bot
+
+    def test_loss_streak_pause_is_skipped_in_dry_run(self):
+        bot = self._loss_streak_bot(dry_run=True)
+        with patch("bot.time.sleep") as sleep, self.assertRaises(RuntimeError):
+            bot.run_cycle()
+        sleep.assert_not_called()
+
+    def test_loss_streak_pause_still_applies_in_live_mode(self):
+        bot = self._loss_streak_bot(dry_run=False)
+        with patch("bot.time.sleep") as sleep, self.assertRaises(RuntimeError):
+            bot.run_cycle()
+        sleep.assert_any_call(300)
+        self.assertEqual(bot.j.data["consec_losses"], 0)
+
     def test_run_cycle_in_dry_run_uses_mocked_trade_execution(self):
         cfg = Config()
         cfg.DRY_RUN = True
@@ -199,6 +231,59 @@ class TestPumpPortalAmountParsing(unittest.TestCase):
 
 
 class TestScannerFiltersAndMintMatching(unittest.TestCase):
+    def test_market_cap_filter_caps_candidates_at_ten_thousand(self):
+        cfg = ScannerConfig()
+        listener = PumpFunListener(cfg)
+
+        self.assertEqual(cfg.min_market_cap_usd, 1_000)
+        self.assertEqual(cfg.max_market_cap_usd, 10_000)
+
+        at_cap = make_candidate(market_cap=10_000)
+        ok, reason = listener._passes_filters(at_cap)
+        self.assertTrue(ok, reason)
+
+        above_cap = make_candidate(market_cap=10_001)
+        ok, reason = listener._passes_filters(above_cap)
+        self.assertFalse(ok)
+        self.assertIn("mcap too high", reason)
+
+    def test_creator_buy_cap_is_five_sol_and_applies_to_filters(self):
+        cfg = ScannerConfig()
+        listener = PumpFunListener(cfg)
+        self.assertEqual(cfg.max_initial_buy_sol, 5.0)
+
+        ok, reason = listener._passes_filters(make_candidate(initial_buy_sol=5.0))
+        self.assertTrue(ok, reason)
+        ok, reason = listener._passes_filters(make_candidate(initial_buy_sol=5.01))
+        self.assertFalse(ok)
+        self.assertIn("dev bought too much", reason)
+        ok, reason = listener._passes_filters(make_candidate(initial_buy_sol=None))
+        self.assertTrue(ok, reason)
+
+    def test_holder_thresholds_are_nominal_but_data_is_still_required(self):
+        cfg = ScannerConfig()
+        listener = PumpFunListener(cfg)
+        self.assertEqual(cfg.min_holder_count, 10)
+        self.assertEqual(cfg.max_top10_holder_pct, 90.0)
+
+        ok, reason = listener._passes_filters(
+            make_candidate(holder_count=10, top10_pct=90.0))
+        self.assertTrue(ok, reason)
+
+        ok, reason = listener._passes_filters(
+            make_candidate(holder_count=9, top10_pct=50.0))
+        self.assertFalse(ok)
+        self.assertIn("too few holders", reason)
+
+        ok, reason = listener._passes_filters(
+            make_candidate(holder_count=50, top10_pct=90.1))
+        self.assertFalse(ok)
+        self.assertIn("concentrated", reason)
+
+        ok, reason = listener._passes_filters(
+            make_candidate(holder_count=0, top10_pct=0.0))
+        self.assertFalse(ok)
+
     def test_max_age_filter_accepts_five_minutes_and_rejects_older_tokens(self):
         cfg = ScannerConfig()
         listener = PumpFunListener(cfg)
@@ -216,26 +301,33 @@ class TestScannerFiltersAndMintMatching(unittest.TestCase):
     def test_reduced_activity_thresholds_are_applied(self):
         cfg = ScannerConfig()
         listener = PumpFunListener(cfg)
-        self.assertEqual(cfg.min_volume_5m_usd, 300)
-        self.assertEqual(cfg.min_txns_5m, 5)
-        self.assertEqual(cfg.min_buys_5m, 3)
+        self.assertEqual(cfg.min_volume_5m_usd, 50)
+        self.assertEqual(cfg.min_txns_5m, 2)
+        self.assertEqual(cfg.min_buys_5m, 2)
         eligible = make_candidate(
-            volume_5m=300, txns_5m_buys=3, txns_5m_sells=2
+            volume_5m=50, txns_5m_buys=2, txns_5m_sells=0
         )
         ok, reason = listener._passes_filters(eligible)
         self.assertTrue(ok, reason)
 
-        too_little_volume = make_candidate(volume_5m=299)
+        too_little_volume = make_candidate(volume_5m=49)
         ok, reason = listener._passes_filters(too_little_volume)
         self.assertFalse(ok)
         self.assertIn("low volume", reason)
 
         too_few_transactions = make_candidate(
-            volume_5m=300, txns_5m_buys=2, txns_5m_sells=2
+            volume_5m=50, txns_5m_buys=1, txns_5m_sells=0
         )
         ok, reason = listener._passes_filters(too_few_transactions)
         self.assertFalse(ok)
         self.assertIn("low activity", reason)
+
+        too_few_buys = make_candidate(
+            volume_5m=50, txns_5m_buys=1, txns_5m_sells=1
+        )
+        ok, reason = listener._passes_filters(too_few_buys)
+        self.assertFalse(ok)
+        self.assertIn("few buys", reason)
 
     def test_actual_scanner_filter_rejects_unknown_holder_data(self):
         cfg = ScannerConfig()
@@ -363,6 +455,107 @@ class TestScannerFiltersAndMintMatching(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertEqual(candidate.liquidity_source, "Pump.fun real quote reserves")
 
+
+    def _holder_recheck_pair(self, **overrides):
+        pair = {
+            "chainId": "solana",
+            "dexId": "pumpfun",
+            "pairAddress": "PairX",
+            "baseToken": {"address": "MintX", "symbol": "X", "name": "X"},
+            "pairCreatedAt": time.time() * 1000,
+            "liquidity": {"usd": 3_000},
+            "priceUsd": "0.00001",
+            "marketCap": 10_000,
+            "volume": {"m5": 2_000, "h1": 5_000},
+            "priceChange": {"m5": 10, "h1": 20},
+            "txns": {"m5": {"buys": 20, "sells": 5}},
+        }
+        pair.update(overrides)
+        return pair
+
+    def test_immature_holder_data_is_rechecked_until_it_passes(self):
+        listener = PumpFunListener(ScannerConfig(pair_wait_sec=1))
+        listener.dex.get_pairs_for_mint = MagicMock(
+            return_value=[self._holder_recheck_pair()]
+        )
+        listener.holders.get_metrics = MagicMock(
+            side_effect=[(1, 100.0), (15, 40.0)]
+        )
+
+        with patch("token_scanner.time.sleep") as sleep:
+            candidate = listener._evaluate_mint("MintX", "X", "X", None)
+
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.holder_count, 15)
+        self.assertEqual(listener.holders.get_metrics.call_count, 2)
+        sleep.assert_called_once_with(30.0)
+
+    def test_holder_recheck_is_bounded_and_stays_fail_closed(self):
+        listener = PumpFunListener(
+            ScannerConfig(pair_wait_sec=1, holder_recheck_attempts=2)
+        )
+        listener.dex.get_pairs_for_mint = MagicMock(
+            return_value=[self._holder_recheck_pair()]
+        )
+        listener.holders.get_metrics = MagicMock(return_value=None)
+
+        with patch("token_scanner.time.sleep"):
+            candidate = listener._evaluate_mint("MintX", "X", "X", None)
+
+        self.assertIsNone(candidate)
+        self.assertEqual(listener.holders.get_metrics.call_count, 3)
+
+    def test_find_best_does_not_wait_for_in_flight_evaluations(self):
+        listener = PumpFunListener(ScannerConfig())
+
+        async def fake_listen(result_queue, stop_event):
+            listener._eval_executor.submit(time.sleep, 2.0)  # slow in-flight work
+            await result_queue.put(make_candidate())
+            await asyncio.sleep(30)
+
+        started = time.monotonic()
+        with patch.object(listener, "_listen_with_fallback", fake_listen):
+            candidate = listener.find_best(max_wait_minutes=1)
+        elapsed = time.monotonic() - started
+
+        self.assertIsNotNone(candidate)
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(listener._stop_requested.is_set())
+
+    def test_evaluation_thread_exits_once_scan_has_stopped(self):
+        listener = PumpFunListener(ScannerConfig(pair_wait_sec=5))
+        listener.dex.get_pairs_for_mint = MagicMock(return_value=[])
+        listener._stop_requested.set()
+        self.assertIsNone(listener._evaluate_mint("MintX", "X", "X", None))
+        listener.dex.get_pairs_for_mint.assert_not_called()
+
+    def test_holder_recheck_stops_after_sleep_if_scan_ended(self):
+        listener = PumpFunListener(ScannerConfig(pair_wait_sec=1))
+        listener.dex.get_pairs_for_mint = MagicMock(
+            return_value=[self._holder_recheck_pair()]
+        )
+        listener.holders.get_metrics = MagicMock(return_value=(1, 100.0))
+
+        def stop_during_sleep(_seconds):
+            listener._stop_requested.set()
+
+        with patch("token_scanner.time.sleep", stop_during_sleep):
+            self.assertIsNone(listener._evaluate_mint("MintX", "X", "X", None))
+        self.assertEqual(listener.holders.get_metrics.call_count, 1)
+
+    def test_holder_recheck_skipped_when_other_filter_fails(self):
+        listener = PumpFunListener(ScannerConfig(pair_wait_sec=1))
+        listener.dex.get_pairs_for_mint = MagicMock(
+            return_value=[self._holder_recheck_pair(marketCap=50_000)]
+        )
+        listener.holders.get_metrics = MagicMock(return_value=(1, 100.0))
+
+        with patch("token_scanner.time.sleep") as sleep:
+            candidate = listener._evaluate_mint("MintX", "X", "X", None)
+
+        self.assertIsNone(candidate)
+        self.assertEqual(listener.holders.get_metrics.call_count, 1)
+        sleep.assert_not_called()
 
     def test_missing_liquidity_pair_is_retried_until_data_is_available(self):
         listener = PumpFunListener(ScannerConfig(pair_wait_sec=2))
@@ -576,6 +769,57 @@ class TestPriceOracleValidation(unittest.TestCase):
             (0.001, 5000.0),
         )
 
+    def test_executable_price_from_jupiter_sell_quote(self):
+        with patch("bot.JupiterClient") as jupiter:
+            jupiter.return_value.get_quote.return_value = {"outAmount": "1500000"}
+            price = self.oracle.get_executable_price("MintX", 3.0, 6)
+        self.assertAlmostEqual(price, 0.5)
+        args = jupiter.return_value.get_quote.call_args.args
+        self.assertEqual(args, ("MintX", self.cfg.INPUT_MINT, 3_000_000))
+
+    def test_executable_price_is_none_when_quote_unusable(self):
+        with patch("bot.JupiterClient") as jupiter:
+            client = jupiter.return_value
+            client.get_quote.return_value = {"outAmount": "0"}
+            self.assertIsNone(self.oracle.get_executable_price("MintX", 3.0, 6))
+            client.get_quote.return_value = {}
+            self.assertIsNone(self.oracle.get_executable_price("MintX", 3.0, 6))
+            client.get_quote.side_effect = RuntimeError("no route")
+            self.assertIsNone(self.oracle.get_executable_price("MintX", 3.0, 6))
+        for amount in (0, -1.0, float("nan")):
+            self.assertIsNone(self.oracle.get_executable_price("MintX", amount, 6))
+
+    def test_missing_dex_liquidity_is_unknown_not_zero(self):
+        for liquidity_field in (None, {}, {"usd": None}):
+            with self.subTest(liquidity=liquidity_field):
+                pair = self.pair(price="0.001")
+                pair["liquidity"] = liquidity_field
+                self.oracle.dex.get_pairs_for_mint.return_value = [pair]
+                self.assertEqual(
+                    self.oracle.get_price_and_liquidity("MintX"),
+                    (0.001, None),
+                )
+
+    def test_explicit_zero_dex_liquidity_stays_zero(self):
+        self.oracle.dex.get_pairs_for_mint.return_value = [
+            self.pair(price="0.001", liquidity=0)
+        ]
+        self.assertEqual(
+            self.oracle.get_price_and_liquidity("MintX"),
+            (0.001, 0.0),
+        )
+
+    def test_known_liquidity_pair_is_preferred_over_unknown_pair(self):
+        unknown = self.pair(price="0.5")
+        unknown["liquidity"] = None
+        self.oracle.dex.get_pairs_for_mint.return_value = [
+            unknown, self.pair(price="0.001", liquidity=5000)
+        ]
+        self.assertEqual(
+            self.oracle.get_price_and_liquidity("MintX"),
+            (0.001, 5000.0),
+        )
+
     def test_non_finite_dex_prices_are_rejected(self):
         for price in ("NaN", "Infinity", "-Infinity"):
             with self.subTest(price=price):
@@ -715,6 +959,109 @@ class TestWebSocketFailover(unittest.TestCase):
             ) as evaluate:
                 await listener._listen_ws("endpoint", result_queue, stop_event)
             evaluate.assert_called_once_with("MintX", "Token X", "X", None)
+
+        asyncio.run(run_test())
+
+    def test_dust_and_oversized_initial_buys_are_not_evaluated_but_unknown_and_real_buys_are(self):
+        events = [
+            {"txType": "create", "mint": "Zero", "name": "Z", "symbol": "Z", "solAmount": 0},
+            {"txType": "create", "mint": "Dust", "name": "D", "symbol": "D", "solAmount": 0.05},
+            {"txType": "create", "mint": "Real", "name": "R", "symbol": "R", "solAmount": 2.0},
+            {"txType": "create", "mint": "AtCap", "name": "C", "symbol": "C", "solAmount": 5.0},
+            {"txType": "create", "mint": "Whale", "name": "W", "symbol": "W", "solAmount": 9.8},
+            {"txType": "create", "mint": "Unknown", "name": "U", "symbol": "U"},
+        ]
+
+        class Socket:
+            def __init__(self, stop_event):
+                self.stop_event = stop_event
+                self.messages = [json.dumps(e) for e in events]
+
+            async def send(self, message):
+                pass
+
+            async def recv(self):
+                if self.messages:
+                    return self.messages.pop(0)
+                await asyncio.sleep(0.05)
+                self.stop_event.set()
+                raise RuntimeError("test disconnect")
+
+        class Context:
+            def __init__(self, stop_event):
+                self.socket = Socket(stop_event)
+
+            async def __aenter__(self):
+                return self.socket
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def run_test():
+            listener = PumpFunListener(ScannerConfig())
+            stop_event = asyncio.Event()
+            with patch(
+                "token_scanner.websockets.connect",
+                return_value=Context(stop_event),
+            ), patch.object(
+                listener, "_evaluate_mint", return_value=None
+            ) as evaluate:
+                await listener._listen_ws("endpoint", asyncio.Queue(), stop_event)
+            self.assertEqual(
+                sorted(call.args[0] for call in evaluate.call_args_list),
+                ["AtCap", "Real", "Unknown"],
+            )
+
+        asyncio.run(run_test())
+
+    def test_launch_that_waited_too_long_for_a_slot_is_dropped(self):
+        class Socket:
+            def __init__(self, stop_event):
+                self.stop_event = stop_event
+                self.messages = [
+                    json.dumps({"txType": "create", "mint": mint,
+                                "name": mint, "symbol": mint})
+                    for mint in ("MintA", "MintB")
+                ]
+
+            async def send(self, message):
+                pass
+
+            async def recv(self):
+                if self.messages:
+                    return self.messages.pop(0)
+                await asyncio.sleep(0.6)
+                self.stop_event.set()
+                raise RuntimeError("test disconnect")
+
+        class Context:
+            def __init__(self, stop_event):
+                self.socket = Socket(stop_event)
+
+            async def __aenter__(self):
+                return self.socket
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        def slow_evaluate(*_args):
+            time.sleep(0.25)
+            return None
+
+        async def run_test():
+            listener = PumpFunListener(
+                ScannerConfig(max_parallel_evaluations=1, max_queue_wait_sec=0.05)
+            )
+            stop_event = asyncio.Event()
+            with patch(
+                "token_scanner.websockets.connect",
+                return_value=Context(stop_event),
+            ), patch.object(
+                listener, "_evaluate_mint", side_effect=slow_evaluate
+            ) as evaluate:
+                await listener._listen_ws("endpoint", asyncio.Queue(), stop_event)
+            self.assertEqual(evaluate.call_count, 1)
+            self.assertEqual(evaluate.call_args.args[0], "MintA")
 
         asyncio.run(run_test())
 
@@ -888,6 +1235,94 @@ class TestStopLossMonitor(unittest.TestCase):
         with self.assertRaises(_PricesExhausted) as ctx:
             self.run_monitor(prices, **kwargs)
         self.assertEqual(ctx.exception.polls, polls)
+
+    # Fast executable price beats a stale DexScreener price.
+    def test_monitor_prefers_executable_price_over_stale_dex_price(self):
+        clock = [1_000.0]
+        exec_feed = iter([1.0, 0.90, 0.70])
+        slept = []
+
+        def fake_sleep(seconds):
+            slept.append(seconds)
+            clock[0] += 3.0
+
+        cfg = Config()
+        fake_self = SimpleNamespace(
+            oracle=SimpleNamespace(
+                get_price_and_liquidity=lambda _m: (1.0, 10_000.0),
+                get_executable_price=lambda *_a: next(exec_feed),
+            ),
+            cfg=cfg,
+            j=SimpleNamespace(data={}, save=MagicMock()),
+        )
+        position = {
+            "target_price": 2.0, "stop_price": self.STOP,
+            "token_mint": "StopLossMint1111", "token_symbol": "SL",
+            "entry_price": 1.0, "token_amount": 10.0, "token_decimals": 6,
+            "trailing_active": False, "trailing_peak_price": None,
+        }
+        with patch("bot.time.time", lambda: clock[0]), \
+                patch("bot.time.sleep", fake_sleep):
+            result = CompoundingBot.monitor_price(fake_self, position)
+
+        self.assertEqual(result, ("stop_loss", 0.70))
+        self.assertEqual(set(slept), {cfg.MONITOR_POLL_SEC})
+
+    def test_monitor_falls_back_to_dex_price_without_executable_quote(self):
+        clock = [1_000.0]
+        dex_feed = iter([1.0, 0.90, 0.70])
+        fake_self = SimpleNamespace(
+            oracle=SimpleNamespace(
+                get_price_and_liquidity=lambda _m: (next(dex_feed), 10_000.0),
+                get_executable_price=lambda *_a: None,
+            ),
+            cfg=Config(),
+            j=SimpleNamespace(data={}, save=MagicMock()),
+        )
+        position = {
+            "target_price": 2.0, "stop_price": self.STOP,
+            "token_mint": "StopLossMint1111", "token_symbol": "SL",
+            "entry_price": 1.0, "token_amount": 10.0, "token_decimals": 6,
+            "trailing_active": False, "trailing_peak_price": None,
+        }
+
+        def fake_sleep(_seconds):
+            clock[0] += 3.0
+
+        with patch("bot.time.time", lambda: clock[0]), \
+                patch("bot.time.sleep", fake_sleep):
+            result = CompoundingBot.monitor_price(fake_self, position)
+
+        self.assertEqual(result, ("stop_loss", 0.70))
+
+    def test_default_trailing_arms_at_1_25x_and_sells_on_20pct_pullback(self):
+        self.assertEqual(Config.PRICE_TARGET_MULT, 1.25)
+        self.assertEqual(Config.TRAILING_DRAWDOWN_PCT, 20.0)
+        clock = [1_000.0]
+        feed = iter([1.0, 1.3, 1.6, 1.27, 1.2])  # arms 1.3, peak 1.6, stop 1.28
+        fake_self = SimpleNamespace(
+            oracle=SimpleNamespace(
+                get_price_and_liquidity=lambda _m: (next(feed), 10_000.0),
+            ),
+            cfg=Config(),
+            j=SimpleNamespace(data={}, save=MagicMock()),
+        )
+        position = {
+            "target_price": 1.0 * Config.PRICE_TARGET_MULT, "stop_price": self.STOP,
+            "token_mint": "TrailMint1111", "token_symbol": "TR",
+            "entry_price": 1.0, "token_amount": 10.0, "token_decimals": 6,
+            "trailing_active": False, "trailing_peak_price": None,
+        }
+
+        def fake_sleep(_seconds):
+            clock[0] += 3.0
+
+        with patch("bot.time.time", lambda: clock[0]), \
+                patch("bot.time.sleep", fake_sleep):
+            result = CompoundingBot.monitor_price(fake_self, position)
+
+        self.assertEqual(result, ("trailing_stop", 1.2))
+        self.assertEqual(position["trailing_peak_price"], 1.6)
 
     # 1. Sustained crash exits immediately.
     def test_cascading_crash_exits_on_first_breach(self):
@@ -1367,6 +1802,30 @@ class TestTransactionReconciliation(TestLiveTradingGate):
         self.assertAlmostEqual(pos["usdc_spent"], 2.0)
         self.assertIsNone(self.bot.j.data["pending_tx"])
 
+    def test_buy_refused_when_price_ran_past_market_cap_cap(self):
+        # candidate: price 0.3 @ mcap 8,000. A $2 quote for 5 tokens = 0.4/token,
+        # implying mcap ~10,667, above the 10,000 cap.
+        self.bot.jup.get_quote.return_value = {"outAmount": "5000000"}
+        with self.assertLogs("bot", level="WARNING") as logs:
+            self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.assertIn("ran up since evaluation", "\n".join(logs.output))
+        self.bot.jup.build_swap_transaction.assert_not_called()
+        self.bot.jup.submit_encoded.assert_not_called()
+        self.assertIsNone(self.bot.j.data.get("pending_tx"))
+
+    def test_buy_allowed_when_entry_stays_within_market_cap_cap(self):
+        # 6 tokens for $2 = 0.333/token -> implied mcap ~8,889 (< 10,000).
+        self.bot.jup.get_quote.return_value = {"outAmount": "6000000"}
+        self.bot.jup.submit_encoded.side_effect = lambda signed: (self.land_buy(), "SIG1")[1]
+        self.assertIsNotNone(self.bot.execute_buy(2.0, self.cand))
+
+    def test_buy_refused_when_entry_market_cap_cannot_be_verified(self):
+        bad = make_candidate(price_usd=0.0)
+        with self.assertLogs("bot", level="ERROR") as logs:
+            self.assertIsNone(self.bot.execute_buy(2.0, bad))
+        self.assertIn("Cannot verify entry market cap", "\n".join(logs.output))
+        self.bot.jup.build_swap_transaction.assert_not_called()
+
     def test_direct_buy_is_refused_while_position_is_open(self):
         self.bot.j.data["open_position"] = self.position()
         with self.assertLogs("bot", level="ERROR"):
@@ -1408,6 +1867,37 @@ class TestTransactionReconciliation(TestLiveTradingGate):
         self.bot.jup.submit_encoded.return_value = "SIG1"
         self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
         self.assertIsNone(self.bot.j.data["pending_tx"])
+
+    def test_failed_buy_retries_once_with_fresh_wider_quote(self):
+        attempts = []
+
+        def submit(_signed):
+            attempts.append(1)
+            if len(attempts) == 1:
+                self.rpc.status = {"confirmationStatus": "confirmed", "err": {"x": 1}}
+            else:
+                self.land_buy()
+            return "SIG1"
+
+        self.bot.jup.submit_encoded.side_effect = submit
+        pos = self.bot.execute_buy(2.0, self.cand)
+        self.assertIsNotNone(pos)
+        self.assertEqual(self.bot.jup.get_quote.call_count, 2)
+        self.assertEqual(self.bot.jup.get_quote.call_args.kwargs["slippage_bps"], 500)
+        self.assertEqual(len(attempts), 2)
+
+    def test_failed_buy_retry_is_limited_to_one_attempt(self):
+        self.rpc.status = {"confirmationStatus": "confirmed", "err": {"x": 1}}
+        self.bot.jup.submit_encoded.return_value = "SIG1"
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.assertEqual(self.bot.jup.submit_encoded.call_count, 2)
+        self.assertIsNone(self.bot.j.data["pending_tx"])
+
+    def test_unknown_buy_state_is_never_retried(self):
+        self.bot.jup.submit_encoded.return_value = "SIG1"
+        self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.assertEqual(self.bot.jup.submit_encoded.call_count, 1)
+        self.assertEqual(self.bot.jup.get_quote.call_count, 1)
 
     def test_legacy_finalized_status_is_confirmed(self):
         self.rpc.status = {"confirmations": None, "err": None}
@@ -1710,8 +2200,78 @@ class TestCurveRoute(TestLiveTradingGate):
         self.bot._sol_usd = MagicMock(return_value=150.0)
         self.bot.oracle.get_token_decimals = MagicMock(return_value=6)
 
-        self.assertIsNone(self.bot._curve_reserve_metrics(self.cand.mint))
+        with self.assertLogs("bot", level="INFO") as logs:
+            self.assertIsNone(self.bot._curve_reserve_metrics(self.cand.mint))
+        self.assertIn("quote mint is not SOL", "\n".join(logs.output))
         self.bot._sol_usd.assert_not_called()
+
+    def test_curve_reserve_fallback_accepts_native_sol_quote_but_buy_route_stays_wsol_only(self):
+        from chain import NATIVE_SOL_QUOTE
+        self.bot._curve_state = MagicMock(return_value={
+            "complete": False,
+            "quote_mint": NATIVE_SOL_QUOTE,
+            "is_cashback_coin": False,
+            "is_mayhem_mode": False,
+            "virtual_token_reserves": 1_000_000_000_000,
+            "virtual_quote_reserves": 30_000_000_000,
+            "real_quote_reserves": 25_000_000_000,
+            "token_total_supply": 1_000_000_000_000_000,
+        })
+        self.bot._sol_usd = MagicMock(return_value=150.0)
+        self.bot._curve_sol_usd_cache = None
+
+        metrics = self.bot._curve_reserve_metrics(self.cand.mint)
+
+        self.assertEqual(metrics.liquidity_usd, 3_750.0)
+        self.bot.jup.build_swap_transaction.assert_not_called()
+        with self.assertLogs("bot", level="ERROR"):
+            self.assertIsNone(self.bot.execute_buy(2.0, self.cand))
+        self.bot.portal.build_transaction.assert_not_called()
+
+    def test_curve_reserve_fallback_rejects_untouched_curve_with_clear_reason(self):
+        self.bot._curve_state = MagicMock(return_value={
+            "complete": False,
+            "quote_mint": "11111111111111111111111111111111",
+            "is_cashback_coin": False,
+            "is_mayhem_mode": False,
+            "virtual_token_reserves": 1_073_000_000_000_000,
+            "virtual_quote_reserves": 30_000_000_000,
+            "real_quote_reserves": 0,
+            "token_total_supply": 1_000_000_000_000_000,
+        })
+        self.bot._sol_usd = MagicMock(return_value=150.0)
+        self.bot.oracle.get_token_decimals = MagicMock(return_value=6)
+
+        with self.assertLogs("bot", level="INFO") as logs:
+            self.assertIsNone(self.bot._curve_reserve_metrics(self.cand.mint))
+
+        output = "\n".join(logs.output)
+        self.assertIn("no real quote reserves yet", output)
+        self.assertNotIn("derived metrics", output)
+        self.bot._sol_usd.assert_not_called()
+        self.bot.oracle.get_token_decimals.assert_not_called()
+
+    def test_curve_reserve_fallback_rejects_completed_curve_with_zero_reserves(self):
+        self.rpc.account = TestChainHelpers._curve_bytes(
+            complete=True, vtok=0, vquote=0)
+
+        with self.assertLogs("bot", level="INFO") as logs:
+            self.assertIsNone(self.bot._curve_reserve_metrics(self.cand.mint))
+
+        self.assertIn("curve is complete", "\n".join(logs.output))
+        self.bot.jup.get_quote.assert_not_called()
+
+    def test_curve_reserve_fallback_logs_value_error_reason(self):
+        self.bot._curve_state = MagicMock(
+            side_effect=ValueError("not a bonding-curve account"))
+
+        with self.assertLogs("bot", level="WARNING") as logs:
+            self.assertIsNone(self.bot._curve_reserve_metrics(self.cand.mint))
+
+        self.assertIn(
+            "validation: not a bonding-curve account",
+            "\n".join(logs.output),
+        )
 
     def test_curve_buy_fills_from_sol_delta_and_keeps_quote_separate(self):
         self.bot.jup.submit_encoded.side_effect = self.land_buy
@@ -2028,6 +2588,17 @@ class TestChainHelpers(unittest.TestCase):
         usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
         with self.assertRaises(ValueError):
             curve_price_sol(parse_bonding_curve(self._curve_bytes(quote=usdc)))
+
+    def test_completed_curve_can_have_zero_virtual_reserves(self):
+        from chain import curve_price_sol
+        curve = parse_bonding_curve(
+            self._curve_bytes(complete=True, vtok=0, vquote=0))
+
+        self.assertTrue(curve["complete"])
+        self.assertEqual(curve["virtual_token_reserves"], 0)
+        self.assertEqual(curve["virtual_quote_reserves"], 0)
+        with self.assertRaises(ValueError):
+            curve_price_sol(curve)
 
     def _rpc_with(self, payload):
         session = MagicMock()

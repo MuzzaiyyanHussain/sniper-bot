@@ -213,6 +213,10 @@ class PumpPortalLocalClient:
 # compatibility has not been established.
 BONDING_CURVE_DISCRIMINATOR = bytes([23, 183, 248, 55, 96, 216, 172, 96])
 WSOL_MINT = "So11111111111111111111111111111111111111112"
+# Observed as quote_mint on live incomplete curves whose reserves are in lamports
+# (~30 SOL virtual); treated as native SOL only for read-only price/liquidity.
+NATIVE_SOL_QUOTE = "11111111111111111111111111111111"
+SOL_QUOTE_MINTS = (WSOL_MINT, NATIVE_SOL_QUOTE)
 _CURVE_STRUCT = struct.Struct("<8s5QB32sBB32s")
 
 
@@ -238,7 +242,7 @@ def parse_bonding_curve(data: bytes) -> dict:
         raise ValueError("not a bonding-curve account")
     if complete not in (0, 1) or mayhem not in (0, 1) or cashback not in (0, 1):
         raise ValueError("bonding-curve flags are invalid")
-    if vtok <= 0 or vquote <= 0:
+    if not complete and (vtok <= 0 or vquote <= 0):
         raise ValueError("bonding-curve virtual reserves must be positive")
     return {
         "virtual_token_reserves": vtok,
@@ -258,7 +262,7 @@ def curve_price_sol(curve: dict, token_decimals: int = 6) -> float:
 
     Only valid for SOL-paired, incomplete curves; anything else fails closed.
     """
-    if curve.get("complete") or curve.get("quote_mint") != WSOL_MINT:
+    if curve.get("complete") or curve.get("quote_mint") not in SOL_QUOTE_MINTS:
         raise ValueError("curve is complete or not SOL-paired")
     sol = curve["virtual_quote_reserves"] / 1e9
     tokens = curve["virtual_token_reserves"] / (10 ** token_decimals)

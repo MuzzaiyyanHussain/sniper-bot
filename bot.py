@@ -30,12 +30,15 @@ from token_scanner import (
     CurveReserveMetrics,
 )
 from chain import (
-    RpcClient, RpcError, PumpPortalLocalClient, PUMPFUN_PROGRAM_ID, WSOL_MINT,
+    RpcClient, RpcError, PumpPortalLocalClient, PUMPFUN_PROGRAM_ID, WSOL_MINT, SOL_QUOTE_MINTS,
     bonding_curve_address, parse_bonding_curve, curve_price_sol,
 )
 
 load_dotenv()
 log = logging.getLogger(__name__)
+
+
+BUY_RETRY_SLIPPAGE_BPS = 500
 
 
 def configure_logging():
@@ -75,7 +78,13 @@ class Config:
     FIXED_OUTPUT_MINT:     str   = os.getenv("FIXED_OUTPUT_MINT", "So11111111111111111111111111111111111111112")
     SCAN_MAX_WAIT_MIN:     int   = int(os.getenv("SCAN_MAX_WAIT_MIN", "15"))
     POLL_INTERVAL_SEC:     int   = int(os.getenv("POLL_INTERVAL_SEC", "8"))
-    PRICE_TARGET_MULT:     float = float(os.getenv("PRICE_TARGET_MULT", "2.0"))
+    # Open-position price polling. DexScreener refreshes ~30s, so exits use a
+    # Jupiter sell quote when available; keep this >=2s to respect rate limits.
+    MONITOR_POLL_SEC:      float = float(os.getenv("MONITOR_POLL_SEC", "3"))
+    # Price multiple (vs entry) at which the trailing exit arms. Below it only
+    # the stop-loss protects the position; above it a TRAILING_DRAWDOWN_PCT
+    # pullback from the peak sells.
+    PRICE_TARGET_MULT:     float = float(os.getenv("PRICE_TARGET_MULT", "1.25"))
     STOP_LOSS_MULT:        float = float(os.getenv("STOP_LOSS_MULT", "0.82"))
     TRAILING_DRAWDOWN_PCT: float = float(os.getenv("TRAILING_DRAWDOWN_PCT", "20"))
     MAX_CYCLES:            int   = int(os.getenv("MAX_CYCLES", "0"))  # 0 = run until Ctrl+C
@@ -396,6 +405,7 @@ class PriceOracle:
         self.session = requests.Session()
         self.dex = DexScreenerClient()
         self._decimals_cache: dict = {}
+        self._jup = None
 
     def get_token_decimals(self, token_mint: str) -> int:
         """Fetch verified on-chain mint decimals; never guess on RPC failure."""
@@ -450,7 +460,12 @@ class PriceOracle:
             for pair in sol_pairs:
                 try:
                     liquidity_data = pair.get("liquidity")
-                    liquidity_raw = liquidity_data.get("usd") if isinstance(liquidity_data, dict) else 0
+                    liquidity_raw = liquidity_data.get("usd") if isinstance(liquidity_data, dict) else None
+                    if liquidity_raw is None:
+                        # Missing is unknown, not zero: a missing field must not
+                        # trigger the dead-pool exit on a freshly bought token.
+                        valid_pairs.append((None, pair))
+                        continue
                     liquidity = float(liquidity_raw or 0)
                     if not math.isfinite(liquidity) or liquidity < 0:
                         continue
@@ -462,7 +477,10 @@ class PriceOracle:
                 log.warning(f"Invalid DexScreener liquidity for {token_mint[:8]}; rejecting price.")
                 return 0.0, None
 
-            liquidity, best = max(valid_pairs, key=lambda item: item[0])
+            liquidity, best = max(
+                valid_pairs,
+                key=lambda item: -1.0 if item[0] is None else item[0],
+            )
             try:
                 price = float(best.get("priceUsd") or 0)
             except (TypeError, ValueError, OverflowError):
@@ -497,6 +515,31 @@ class PriceOracle:
         except Exception as e:
             log.error(f"Jupiter price fallback failed: {e}")
             return 0.0, None
+
+    def get_executable_price(self, token_mint: str, token_amount: float,
+                             token_decimals: int) -> float | None:
+        """USDC per token from a live Jupiter sell quote for the held amount.
+
+        Returns None (never a guess) when no valid quote is available."""
+        try:
+            if not (math.isfinite(token_amount) and token_amount > 0):
+                return None
+            if self._jup is None:
+                self._jup = JupiterClient(self.cfg)
+            quote = self._jup.get_quote(
+                token_mint, self.cfg.INPUT_MINT,
+                int(token_amount * (10 ** token_decimals)),
+            )
+            out_amount = int(quote["outAmount"])
+            if out_amount <= 0:
+                return None
+            price = (out_amount / 1_000_000) / token_amount  # USDC has 6 decimals
+            if not math.isfinite(price) or price <= 0:
+                return None
+            return price
+        except Exception as exc:
+            log.debug("Jupiter sell-quote price unavailable for %s: %s", token_mint[:8], exc)
+            return None
 
     def get_price_usdc(self, token_mint: str) -> float:
         """Backwards-compatible price-only accessor."""
@@ -1115,13 +1158,41 @@ class CompoundingBot:
         with self._curve_metrics_lock:
             try:
                 curve = self._curve_state(mint)
-                if (
-                    curve is None
-                    or curve["complete"]
-                    or curve["quote_mint"] != WSOL_MINT
-                    or curve["is_cashback_coin"]
-                    or curve["is_mayhem_mode"]
-                ):
+                if curve is None:
+                    log.info(
+                        "On-chain liquidity fallback unavailable for %s: "
+                        "bonding-curve account missing",
+                        mint[:8],
+                    )
+                    return None
+                if curve["complete"]:
+                    log.info(
+                        "On-chain liquidity fallback unavailable for %s: "
+                        "curve is complete",
+                        mint[:8],
+                    )
+                    return None
+                if curve["quote_mint"] not in SOL_QUOTE_MINTS:
+                    log.info(
+                        "On-chain liquidity fallback unavailable for %s: "
+                        "quote mint is not SOL",
+                        mint[:8],
+                    )
+                    return None
+                if curve["is_cashback_coin"] or curve["is_mayhem_mode"]:
+                    log.info(
+                        "On-chain liquidity fallback unavailable for %s: "
+                        "cashback/mayhem curve is unsupported",
+                        mint[:8],
+                    )
+                    return None
+
+                if curve["real_quote_reserves"] <= 0:
+                    log.info(
+                        "On-chain liquidity fallback unavailable for %s: "
+                        "no real quote reserves yet (liquidity $0)",
+                        mint[:8],
+                    )
                     return None
 
                 now = time.monotonic()
@@ -1143,6 +1214,11 @@ class CompoundingBot:
                 market_cap_usd = price_usd * supply
                 values = (liquidity_usd, price_usd, market_cap_usd)
                 if any(not math.isfinite(value) or value <= 0 for value in values):
+                    log.info(
+                        "On-chain liquidity fallback unavailable for %s: "
+                        "derived metrics are invalid",
+                        mint[:8],
+                    )
                     return None
 
                 log.info(
@@ -1151,9 +1227,16 @@ class CompoundingBot:
                     liquidity_usd,
                 )
                 return CurveReserveMetrics(*values)
+            except ValueError as exc:
+                log.warning(
+                    "On-chain liquidity fallback unavailable for %s "
+                    "(validation: %s)",
+                    mint[:8],
+                    exc,
+                )
+                return None
             except (
                 RpcError,
-                ValueError,
                 RuntimeError,
                 requests.RequestException,
                 KeyError,
@@ -1255,6 +1338,32 @@ class CompoundingBot:
         return None
 
     # ── Buy ───────────────────────────────────────────────────────────────────
+    def _retry_buy_after_failure(self, usdc_amount: float, token: TokenCandidate,
+                                 amount_lam: int, token_decimals: int) -> str:
+        """One fresh-quote retry, only after the first buy was finally rejected
+        on-chain (pending cleared, no tokens bought). Never retries ambiguous states."""
+        if kill_switch_active(self.cfg) or self.j.data.get("pending_tx"):
+            return "aborted"
+        retry_bps = max(BUY_RETRY_SLIPPAGE_BPS, self.cfg.SLIPPAGE_BPS)
+        log.warning("   Buy failed on-chain; retrying once with a fresh quote (%d bps)", retry_bps)
+        try:
+            quote = self.jup.get_quote(self.cfg.INPUT_MINT, token.mint, amount_lam,
+                                       slippage_bps=retry_bps)
+            token_amount = int(quote["outAmount"]) / (10 ** token_decimals)
+            if token_amount <= 0:
+                log.error("   Retry quote produced zero tokens; aborting.")
+                return "aborted"
+            raw_tx = self.jup.build_swap_transaction(quote, self.pubkey)
+        except Exception as exc:
+            log.error("   Retry quote/build failed (%s); nothing sent", type(exc).__name__)
+            return "aborted"
+        return self._submit_and_settle("buy", token.mint, raw_tx, {
+            "symbol": token.symbol, "dex_url": token.url,
+            "token_decimals": token_decimals, "usdc_amount": usdc_amount,
+            "quoted_token_amount": token_amount,
+            "quoted_entry_price": usdc_amount / token_amount,
+        })
+
     def execute_buy(self, usdc_amount: float, token: TokenCandidate) -> dict | None:
         if usdc_amount <= 0:
             raise ValueError("Buy amount must be positive")
@@ -1300,6 +1409,23 @@ class CompoundingBot:
             log.error(f"   Quote produced zero tokens for {token.symbol}; aborting.")
             return None
         entry_price = usdc_amount / token_amount if token_amount else 0
+
+        # The candidate was evaluated earlier; on a fast pump the price can run
+        # far past the data the filters saw. Re-apply the market-cap cap at the
+        # price we would actually pay.
+        max_cap = self.scanner.cfg.max_market_cap_usd
+        if not (token.price_usd > 0 and token.market_cap > 0 and entry_price > 0):
+            log.error("   Cannot verify entry market cap for %s; refusing buy.", token.symbol)
+            return None
+        implied_mcap = token.market_cap * (entry_price / token.price_usd)
+        if implied_mcap > max_cap:
+            log.warning(
+                "   ⛔ %s ran up since evaluation: entry implies mcap $%s > cap $%s "
+                "(evaluated at $%s) — refusing buy.",
+                token.symbol, f"{implied_mcap:,.0f}", f"{max_cap:,.0f}",
+                f"{token.market_cap:,.0f}",
+            )
+            return None
         target_price = entry_price * self.cfg.PRICE_TARGET_MULT
         stop_price = entry_price * self.cfg.STOP_LOSS_MULT if self.cfg.STOP_LOSS_MULT > 0 else 0
 
@@ -1322,6 +1448,9 @@ class CompoundingBot:
                 "token_decimals": token_decimals, "usdc_amount": usdc_amount,
                 "quoted_token_amount": token_amount, "quoted_entry_price": entry_price,
             })
+            if outcome == "failed":
+                outcome = self._retry_buy_after_failure(
+                    usdc_amount, token, amount_lam, token_decimals)
             if outcome != "confirmed":
                 log.error("Buy not confirmed (%s) — no position opened.", outcome)
                 return None
@@ -1565,6 +1694,15 @@ class CompoundingBot:
 
         while True:
             price, liquidity_usd = self.oracle.get_price_and_liquidity(mint)
+            # DexScreener refreshes slowly; the Jupiter sell quote is what an
+            # exit would actually receive, so prefer it when available.
+            get_executable_price = getattr(self.oracle, "get_executable_price", None)
+            if get_executable_price is not None:
+                executable = get_executable_price(
+                    mint, position["token_amount"], position.get("token_decimals", 6)
+                )
+                if executable is not None:
+                    price = executable
             now = time.time()
             elapsed = now - start_time
 
@@ -1579,7 +1717,7 @@ class CompoundingBot:
                     )
                     return "no_price", last_good_price
                 log.warning("   Price fetch returned 0 — retrying...")
-                time.sleep(self.cfg.POLL_INTERVAL_SEC)
+                time.sleep(self.cfg.MONITOR_POLL_SEC)
                 continue
             no_price_since = None
 
@@ -1619,7 +1757,7 @@ class CompoundingBot:
                         f"${last_good_price:.8f} → ${price:.8f} "
                         f"({jump_ratio:.1f}x in one tick) — discarding ({discard_count}/{MAX_DISCARDS})"
                     )
-                time.sleep(self.cfg.POLL_INTERVAL_SEC)
+                time.sleep(self.cfg.MONITOR_POLL_SEC)
                 continue
 
             pct = ((price - position["entry_price"]) / position["entry_price"]) * 100
@@ -1701,7 +1839,7 @@ class CompoundingBot:
                 recent_prices.pop(0)
 
             last_good_price = price
-            time.sleep(self.cfg.POLL_INTERVAL_SEC)
+            time.sleep(self.cfg.MONITOR_POLL_SEC)
 
     # ── Cycle ─────────────────────────────────────────────────────────────────
     def run_cycle(self) -> bool:
@@ -1722,7 +1860,9 @@ class CompoundingBot:
             self.j.save()
 
         consec = self.j.data.get("consec_losses", 0)
-        if consec >= self.cfg.MAX_CONSEC_LOSSES and not self.j.data.get("open_position"):
+        # The loss-streak pause is a live-money brake; paper trading never waits.
+        if (not self.cfg.DRY_RUN and consec >= self.cfg.MAX_CONSEC_LOSSES
+                and not self.j.data.get("open_position")):
             log.warning(
                 f"⏸  {consec} consecutive losses — pausing "
                 f"{self.cfg.LOSS_PAUSE_SEC}s before next scan"

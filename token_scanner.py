@@ -9,12 +9,14 @@ Falls back to DexScreener polling if WebSocket is unavailable.
 import time
 import math
 import re
+import threading
 import asyncio
 import logging
 import json
 import requests
 import websockets
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 log = logging.getLogger(__name__)
@@ -49,11 +51,11 @@ class ScannerConfig:
     min_age_minutes:      int   = 0         # no minimum — catch at birth
 
     # Liquidity — pump.fun pools start very small
-    min_liquidity_usd:    float = 2_000
+    min_liquidity_usd:    float = 500
     max_liquidity_usd:    float = 500_000
 
     # Volume
-    min_volume_5m_usd:    float = 300
+    min_volume_5m_usd:    float = 50
 
     # Price action
     min_price_change_5m:  float = -30.0     # allow slight dip on entry
@@ -61,16 +63,16 @@ class ScannerConfig:
 
     # Market cap
     min_market_cap_usd:   float = 1_000
-    max_market_cap_usd:   float = 10_000_000
+    max_market_cap_usd:   float = 10_000
 
     # Transactions
-    min_txns_5m:          int   = 5
-    min_buys_5m:          int   = 3
+    min_txns_5m:          int   = 2
+    min_buys_5m:          int   = 2
     min_buy_sell_ratio:   float = 1.3
 
     # Holder safety
-    max_top10_holder_pct: float = 80.0
-    min_holder_count:     int   = 30
+    max_top10_holder_pct: float = 90.0
+    min_holder_count:     int   = 10
 
     # Allowed DEXes
     allowed_dexes: list = field(default_factory=lambda: [
@@ -84,15 +86,36 @@ class ScannerConfig:
     ])
     max_parallel_evaluations: int = 4
 
+    # Drop a launch that waited this long for an evaluation slot: by the time
+    # it would be checked it is no longer an "early" entry and it only delays
+    # fresher launches behind it.
+    max_queue_wait_sec: float = 45.0
+
+    # Launches whose creator bought less than this are dust/placeholder
+    # launches (liquidity tracks real buying, and the min-liquidity floor needs
+    # several SOL). They are not given an evaluation slot. Unknown initial buy
+    # is still evaluated.
+    min_initial_buy_sol_to_evaluate: float = 0.1
+
     # How long to wait for DexScreener pair data after token launch (seconds)
     pair_wait_sec:        int   = 35
     pair_poll_interval_sec: float = 2.0
 
+    # Holder data on brand-new tokens is thin/unindexed. A token that passes
+    # every other filter is re-checked (fresh pair + holder data) instead of
+    # being dropped. The interval must be >= the Birdeye cache TTL (30s), and
+    # max_age_minutes still applies on every recheck.
+    holder_recheck_attempts: int = 4
+    holder_recheck_interval_sec: float = 30.0
+
     # Fallback polling interval if WebSocket fails
     scan_interval_sec:    int   = 30
 
-    # Initial buy filter — skip tokens where dev bought too much at launch
-    max_initial_buy_sol:  float = 20.0      # skip if dev bought >20 SOL at launch. Was 50.
+    # Initial buy filter — skip tokens where dev bought too much at launch.
+    # A creator buy of N SOL on the fresh curve is roughly 3.4% of supply per
+    # SOL up to ~3 SOL (9.4 SOL ~ 26%): a big creator bag can be dumped in one
+    # tick. In the dry-run sample every launch with a creator buy >= 3 SOL lost.
+    max_initial_buy_sol:  float = 5.0       # was 20 (and 50 before that)
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -616,6 +639,17 @@ class PumpFunListener:
         self.holders = BirdeyeHolderClient(birdeye_api_key)
         self.rug = RugDetector()
         self.scorer = TokenScorer()
+        # Set when a scan ends so in-flight evaluation threads stop promptly.
+        self._stop_requested = threading.Event()
+        self._eval_executor = None
+
+    def _new_eval_executor(self) -> ThreadPoolExecutor:
+        """Dedicated pool so a finished scan never waits on slow evaluations
+        (asyncio.run waits for the *default* executor, which delayed buys)."""
+        return ThreadPoolExecutor(
+            max_workers=max(1, self.cfg.max_parallel_evaluations),
+            thread_name_prefix="eval",
+        )
 
     def _passes_filters(self, t: TokenCandidate) -> tuple:
         cfg = self.cfg
@@ -656,23 +690,22 @@ class PumpFunListener:
                        initial_buy_sol: float | None) -> "TokenCandidate | None":
         """Wait for DexScreener pair data, then evaluate the token."""
         log.info("   🔎 Checking pair data — %s (%s...)", symbol, mint[:8])
+        # Bound to this scan: a later scan replaces self._stop_requested.
+        stop = self._stop_requested
 
         # Honor the configured wait. The HTTP request itself has a bounded timeout.
         deadline = time.monotonic() + max(1, self.cfg.pair_wait_sec)
         matching_pairs = []
 
         while True:
+            if stop.is_set():
+                return None
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
 
             pairs = self.dex.get_pairs_for_mint(mint, timeout=remaining)
-            matching_pairs = [
-                pair for pair in pairs
-                if pair.get("chainId") == "solana"
-                and (pair.get("baseToken", {}).get("address") or "").lower()
-                == mint.lower()
-            ]
+            matching_pairs = self._exact_mint_pairs(mint, pairs)
             has_liquidity = any(
                 isinstance(pair.get("liquidity"), dict)
                 and pair["liquidity"].get("usd") is not None
@@ -692,6 +725,46 @@ class PumpFunListener:
             )
             return None
 
+        eligible = []
+        for attempt in range(self.cfg.holder_recheck_attempts + 1):
+            if attempt:
+                log.info(
+                    "   ⏳ Holder data not ready for %s — rechecking in %.0fs (%d/%d)",
+                    symbol, self.cfg.holder_recheck_interval_sec,
+                    attempt, self.cfg.holder_recheck_attempts,
+                )
+                time.sleep(self.cfg.holder_recheck_interval_sec)
+                if stop.is_set():
+                    return None
+                matching_pairs = self._exact_mint_pairs(
+                    mint, self.dex.get_pairs_for_mint(mint)
+                )
+                if not matching_pairs:
+                    break
+            eligible, holder_pending = self._evaluate_pairs(
+                mint, symbol, initial_buy_sol, matching_pairs
+            )
+            if eligible or not holder_pending:
+                break
+
+        if not eligible:
+            return None
+
+        return max(eligible, key=lambda candidate: candidate.score)
+
+    @staticmethod
+    def _exact_mint_pairs(mint: str, pairs: list) -> list:
+        return [
+            pair for pair in pairs
+            if pair.get("chainId") == "solana"
+            and (pair.get("baseToken", {}).get("address") or "").lower()
+            == mint.lower()
+        ]
+
+    def _evaluate_pairs(self, mint: str, symbol: str,
+                        initial_buy_sol: float | None,
+                        matching_pairs: list) -> tuple:
+        """Return (eligible candidates, whether only holder data is blocking)."""
         curve_metrics = None
         if self.curve_metrics_provider and any(
             not isinstance(pair.get("liquidity"), dict)
@@ -703,6 +776,7 @@ class PumpFunListener:
         # Evaluate each exact-mint pair independently. An old/high-liquidity
         # pool must not hide another pair that may pass the existing filters.
         eligible = []
+        holder_pending = False
 
         for pair in matching_pairs:
             if curve_metrics is None:
@@ -737,15 +811,27 @@ class PumpFunListener:
                     "   SKIP %s on %s: %s",
                     symbol, candidate.dex, reason
                 )
+                if self._is_holder_pending(candidate, reason):
+                    holder_pending = True
                 continue
 
             candidate.score = self.scorer.score(candidate)
             eligible.append(candidate)
 
-        if not eligible:
-            return None
+        return eligible, holder_pending
 
-        return max(eligible, key=lambda candidate: candidate.score)
+    def _is_holder_pending(self, candidate: TokenCandidate, reason: str) -> bool:
+        """True when only (possibly immature) holder data blocks the candidate."""
+        if not (reason == "holder data unavailable or unverified"
+                or reason.startswith("too few holders")
+                or reason.startswith("top-10 holders too concentrated")):
+            return False
+        probe = replace(
+            candidate,
+            holder_count=self.cfg.min_holder_count,
+            top10_pct=self.cfg.max_top10_holder_pct,
+        )
+        return self._passes_filters(probe)[0]
 
     async def _listen_ws(self, endpoint: str, result_queue: asyncio.Queue,
                          stop_event: asyncio.Event):
@@ -805,16 +891,37 @@ class PumpFunListener:
                         if (mint in self._pending_mints
                                 or mint in self._evaluated_mints):
                             continue
+                        if (sol_amt is not None
+                                and not (self.cfg.min_initial_buy_sol_to_evaluate
+                                         <= sol_amt <= self.cfg.max_initial_buy_sol)):
+                            log.debug(
+                                "Not evaluating %s: initial buy %.4f SOL outside %.2f-%.2f",
+                                symbol, sol_amt,
+                                self.cfg.min_initial_buy_sol_to_evaluate,
+                                self.cfg.max_initial_buy_sol,
+                            )
+                            self._evaluated_mints.add(mint)
+                            continue
                         self._pending_mints.add(mint)
 
                         async def evaluate_and_queue(token_mint, token_name, token_symbol, token_sol_amt):
+                            arrived = time.monotonic()
                             try:
                                 async with self._eval_semaphore:
                                     if stop_event.is_set():
                                         return
+                                    waited = time.monotonic() - arrived
+                                    if waited > self.cfg.max_queue_wait_sec:
+                                        log.info(
+                                            "   ⏭ Skipping %s: waited %.0fs for an evaluation slot (stale)",
+                                            token_symbol, waited,
+                                        )
+                                        return
                                     loop = asyncio.get_running_loop()
+                                    if self._eval_executor is None:
+                                        self._eval_executor = self._new_eval_executor()
                                     candidate = await loop.run_in_executor(
-                                        None, self._evaluate_mint, token_mint, token_name,
+                                        self._eval_executor, self._evaluate_mint, token_mint, token_name,
                                         token_symbol, token_sol_amt,
                                     )
                                     if candidate and not stop_event.is_set():
@@ -973,6 +1080,8 @@ class PumpFunListener:
             self._evaluated_mints = set()
             self._eval_semaphore = asyncio.Semaphore(self.cfg.max_parallel_evaluations)
             self._eval_tasks = set()
+            self._stop_requested = threading.Event()
+            self._eval_executor = self._new_eval_executor()
             listener_task = asyncio.create_task(
                 self._listen_with_fallback(result_queue, stop_event)
             )
@@ -987,6 +1096,8 @@ class PumpFunListener:
                 log.warning(f"No qualifying token found in {max_wait_minutes} minutes")
             finally:
                 stop_event.set()
+                self._stop_requested.set()
+                self._eval_executor.shutdown(wait=False, cancel_futures=True)
                 listener_task.cancel()
                 try:
                     await listener_task

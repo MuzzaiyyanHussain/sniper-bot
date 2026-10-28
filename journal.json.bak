@@ -1,0 +1,10 @@
+{
+  "cycle": 0,
+  "play_amount_usdc": 2.0,
+  "total_saved_usdc": 0.0,
+  "total_winnings_usdc": 0.0,
+  "open_position": null,
+  "pending_tx": null,
+  "consec_losses": 0,
+  "history": []
+}
